@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum artifacts/*.apk artifacts/*.zip > artifacts/SHA256SUMS
+
+          cat > release-notes.md <<'EOF'
+          OpenWrt 25.12 / apk fresh-install release.
+
+          Packages:
+          - giwifi-auth-2.0.0-r1.apk
+          - luci-app-giwifi-2.0.0-r1.apk
+          - luci-i18n-giwifi-zh-cn-0.261018.31637.apk
+          - openwrt-giwifi-2.0.0.zip
+
+          Install:
+          ```
+          apk add --allow-untrusted giwifi-auth-2.0.0-r1.apk luci-app-giwifi-2.0.0-r1.apk luci-i18n-giwifi-zh-cn-0.261018.31637.apk
+          ```
+
+          2.0.0 is fresh-install only; no 1.x configuration migration.
+          EOF
+
+          gh release create "${GITHUB_REF_NAME}" \
+            artifacts/*.apk \
+            artifacts/*.zip \
+            artifacts/SHA256SUMS \
+            --title "GiWiFi LuCI ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
