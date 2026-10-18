@@ -83,6 +83,7 @@ do_check() {
     fi
 
     if [ -f /www/luci-static/resources/view/network/giwifi.js ] \
+       && [ -f /www/luci-static/resources/icons/giwifi.svg ] \
        && [ -f /usr/share/luci/menu.d/luci-app-giwifi.json ] \
        && [ -f /usr/share/rpcd/acl.d/luci-app-giwifi.json ]; then
         say "  [OK] LuCI 界面已安装"
@@ -129,14 +130,9 @@ do_uninstall() {
     rm -f /usr/bin/giwifi-auth /etc/init.d/giwifi-auth
     rm -rf /usr/bin/__pycache__ 2>/dev/null || true
     rm -f /www/luci-static/resources/view/network/giwifi.js
+    rm -f /www/luci-static/resources/icons/giwifi.svg
     rm -f /usr/share/luci/menu.d/luci-app-giwifi.json
     rm -f /usr/share/rpcd/acl.d/luci-app-giwifi.json
-    # 旧版 Lua CBI 界面残留
-    rm -f /usr/lib/lua/luci/controller/giwifi.lua
-    rm -f /usr/lib/lua/luci/model/cbi/giwifi.lua
-    rm -rf /usr/lib/lua/luci/giwifi 2>/dev/null || true
-    rm -rf /usr/lib/lua/luci/view/giwifi 2>/dev/null || true
-    rm -f /usr/lib/lua/luci/view/cbi/giwifi_*.htm 2>/dev/null || true
 
     refresh_luci
     say "  已停止并删除服务、脚本与 LuCI 界面。"
@@ -189,17 +185,12 @@ do_install() {
     say "[5/6] 写入 LuCI 界面 ..."
     install_file "$UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js" \
         /www/luci-static/resources/view/network/giwifi.js 644
+    install_file "$UI_DIR/htdocs/luci-static/resources/icons/giwifi.svg" \
+        /www/luci-static/resources/icons/giwifi.svg 644
     install_file "$UI_DIR/root/usr/share/luci/menu.d/luci-app-giwifi.json" \
         /usr/share/luci/menu.d/luci-app-giwifi.json 644
     install_file "$UI_DIR/root/usr/share/rpcd/acl.d/luci-app-giwifi.json" \
         /usr/share/rpcd/acl.d/luci-app-giwifi.json 644
-
-    # 清理旧版 Lua CBI 界面残留（新界面为 LuCI JS 视图）
-    rm -f /usr/lib/lua/luci/model/cbi/giwifi.lua
-    rm -f /usr/lib/lua/luci/controller/giwifi.lua
-    rm -f /usr/lib/lua/luci/view/cbi/giwifi_add.htm
-    rm -f /usr/lib/lua/luci/view/cbi/giwifi_tblsection.htm
-    rm -f /usr/lib/lua/luci/view/cbi/giwifi_form_section.htm
 
     say "[6/6] 配置账号并启动 ..."
     # 账号密码是运行配置，不由安装步骤收集：
@@ -220,9 +211,6 @@ do_install() {
     fi
     if [ -n "$GIWIFI_IFACE_RESTART_TIME" ]; then
         uci set "giwifi-auth.main.iface_restart_time=$GIWIFI_IFACE_RESTART_TIME"
-    elif [ -n "$GIWIFI_IFACE_RESTART_CRON" ]; then
-        # 兼容旧环境变量：cron 仍由后端作为回退读取
-        uci set "giwifi-auth.main.iface_restart_cron=$GIWIFI_IFACE_RESTART_CRON"
     fi
     if [ -n "$GIWIFI_SYNC_UA3F" ]; then
         uci set "giwifi-auth.main.ua3f_sync_ua=$GIWIFI_SYNC_UA3F"
@@ -254,11 +242,6 @@ do_install() {
         fi
         uci set giwifi-auth.main.enabled=1
     fi
-    # LuCI 的“运行状态 / 日志”选项卡使用两个空段作为占位。
-    uci -q show giwifi-auth 2>/dev/null | grep -q '^giwifi-auth\.status=' \
-        || uci set giwifi-auth.status=status
-    uci -q show giwifi-auth 2>/dev/null | grep -q '^giwifi-auth\.log=' \
-        || uci set giwifi-auth.log=log
     uci commit giwifi-auth
 
     refresh_luci

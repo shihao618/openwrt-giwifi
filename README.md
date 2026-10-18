@@ -3,10 +3,13 @@
 在 OpenWrt 路由器上自动登录校园网（GiWiFi Web Portal，`authLogin` 流），掉线自动重登。
 路由器登录后，其 WAN 侧会话即被校园网认证，**整个内网（电脑/手机）都能上网**。
 
+> 2.0.0 起仅面向全新安装（OpenWrt 25.12 / apk），不提供 1.x 旧配置和旧界面的迁移逻辑。
+
 ## 目录结构
 
 ```
 openwrt-giwifi/
+├── artifacts/                    # 随代码发布的预构建 apk / 源码包
 ├── install.sh                    # 一键安装脚本（分别复制后端与 LuCI 界面）
 ├── giwifi-auth/                  # 后端包：认证程序 + 守护 + UCI 配置
 │   ├── Makefile                  # OpenWrt 包定义（PKGARCH:=all）
@@ -59,11 +62,10 @@ HTTP、JSON，无第三方库）：
 LuCI 界面需要：`luci-base`、`luci-mod-network`（通常固件自带），由
 `luci-app-giwifi` 包自动声明依赖。
 
-安装（按固件包管理器二选一）：
+安装（OpenWrt 25.12 / apk）：
 
 ```sh
-apk add giwifi-auth luci-app-giwifi luci-i18n-giwifi-zh-cn      # OpenWrt 25.12 / snapshot（apk）
-opkg install giwifi-auth luci-app-giwifi luci-i18n-giwifi-zh-cn # 老版本固件（opkg）
+apk add giwifi-auth luci-app-giwifi luci-i18n-giwifi-zh-cn
 ```
 
 如果只用 `install.sh` 手动安装，脚本会自动处理后端 Python 依赖；LuCI 基础包需固件自带。
@@ -127,7 +129,6 @@ config giwifi 'main'
 	option interval '30'                # 轮询间隔秒（下限 10）
 	option iface_restart_enabled '0'    # 定时重启接口
 	option iface_restart_time '04:00'   # 每天重启时间 HH:MM
-	option iface_restart_cron '0 4 * * *' # 旧版 cron 回退（新界面不写）
 	option ua3f_sync_ua ''              # 同步给 UA3F 的终端类型，空=不改
 
 # 以下两个空段仅用于 LuCI 的“运行状态 / 日志”选项卡，无配置项
@@ -183,15 +184,13 @@ make package/giwifi-auth/compile \
      package/luci-i18n-giwifi-zh-cn/compile V=s
 ```
 
-生成 `giwifi-auth_<版本>-r<发布号>_all.apk`、
-`luci-app-giwifi_<版本>-r<发布号>_all.apk` 以及由 `po/` 生成的
-`luci-i18n-giwifi-zh-cn-*.apk`（25.12/apk 体系；老版本为 `.ipk`）。
+生成 `giwifi-auth-<版本>-r<发布号>-all.apk`、
+`luci-app-giwifi-<版本>-r<发布号>-all.apk` 以及由 `po/` 生成的
+`luci-i18n-giwifi-zh-cn-*.apk`。
 把三个包都传到路由器安装：
 
 ```sh
 apk add --allow-untrusted giwifi-auth-*.apk luci-app-giwifi-*.apk luci-i18n-giwifi-zh-cn-*.apk
-# 或
-opkg install giwifi-auth_*.ipk luci-app-giwifi_*.ipk luci-i18n-giwifi-zh-cn_*.ipk
 ```
 
 三个包均为 noarch（`PKGARCH:=all` / `LUCI_PKGARCH:=all`），所有架构通用；`/etc/config/giwifi-auth` 已声明为
@@ -215,15 +214,24 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 产物：
 
-- `dist/giwifi-auth_<ver>-r<rel>_all.apk`（或 `.ipk`）；
-- `dist/luci-app-giwifi_<ver>-r<rel>_all.apk`（或 `.ipk`）；
-- `dist/luci-i18n-giwifi-zh-cn-*.apk`（或 `.ipk`，简体中文翻译）；
+- `dist/giwifi-auth-<ver>-r<rel>.apk`；
+- `dist/luci-app-giwifi-<ver>-r<rel>.apk`；
+- `dist/luci-i18n-giwifi-zh-cn-*.apk`（简体中文翻译）；
 - `dist/openwrt-giwifi-<ver>.zip`：源码包。
 
 > Windows 原生环境无法运行 SDK 构建，请在 Linux / WSL 中执行。
 > LuCI 包使用官方 `luci.mk`，SDK 中必须先安装 LuCI feed，否则构建会明确报错。
 
-安装后是否自启由配置决定：新装不启动；升级时若原本 `enabled=1` 且有账号，则保持启用并重启实例，使新版本立即生效。
+安装后是否自启由配置决定：新装默认不启动，配置好账号并打开「启用守护」后才会启动。
+
+## 仓库内预构建包
+
+`artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
+
+- `artifacts/giwifi-auth-2.0.0-r1.apk`
+- `artifacts/luci-app-giwifi-2.0.0-r1.apk`
+- `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
+- `artifacts/openwrt-giwifi-2.0.0.zip`
 
 ## 测试
 

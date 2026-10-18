@@ -19,7 +19,6 @@
     option interval '30'        轮询间隔秒
     option iface_restart_enabled '0/1'   定时重启接口开关
     option iface_restart_time '04:00'   每天重启接口的时间（HH:MM）
-    option iface_restart_cron '0 4 * * *' 兼容旧版的 cron 回退
     option ua3f_sync_ua ''      同步给 UA3F 的终端类型（windows/ipad/iphone/android；空则不动 UA3F；保存时同步）
   config account 'name'         单个账号（可多个）
     option enabled '0/1'        启用该账号
@@ -270,7 +269,6 @@ BASE_URL = "http://10.189.1.3"
 INTERVAL = 30
 IFACE_RESTART_ENABLED = False
 IFACE_RESTART_TIME = ""
-IFACE_RESTART_CRON = "0 4 * * *"
 ENABLED = True
 UA3F_SYNC_UA = ""  # 全局配置：同步给 UA3F 的 UA（空则不动 UA3F）
 
@@ -289,16 +287,9 @@ def _pick_opt(section, key, default):
 def _load_global_cfg():
     """加载 main section 全局配置。"""
     global BASE_URL, INTERVAL, IFACE_RESTART_ENABLED, IFACE_RESTART_TIME, \
-        IFACE_RESTART_CRON, ENABLED, UA3F_SYNC_UA
+        ENABLED, UA3F_SYNC_UA
     sections = _load_uci_config()
-    # 全局配置所在的 section 类型为 giwifi（约定名 main），按名称优先定位，
-    # 避免界面占位段 status/log 排在前面时被误读。
-    main = sections.get("main") if sections.get("main", {}).get(".type") == "giwifi" else {}
-    if not main:
-        for _sec in sections.values():
-            if _sec.get(".type") == "giwifi":
-                main = _sec
-                break
+    main = sections.get("main", {})
     BASE_URL = _pick_opt(main, "base_url", "http://10.189.1.3").rstrip("/")
     try:
         INTERVAL = int(_pick_opt(main, "interval", "30"))
@@ -307,9 +298,7 @@ def _load_global_cfg():
     if INTERVAL < 10:
         INTERVAL = 10
     IFACE_RESTART_ENABLED = _pick_opt(main, "iface_restart_enabled", "0").lower() in ("1", "true", "yes", "on")
-    IFACE_RESTART_TIME = _pick_opt(main, "iface_restart_time", "")
-    # 旧配置只有 cron 表达式；新界面使用 iface_restart_time，cron 仅作回退。
-    IFACE_RESTART_CRON = _pick_opt(main, "iface_restart_cron", "0 4 * * *")
+    IFACE_RESTART_TIME = _pick_opt(main, "iface_restart_time", "04:00")
     ENABLED = _pick_opt(main, "enabled", "0").lower() in ("1", "true", "yes", "on")
     UA3F_SYNC_UA = _pick_opt(main, "ua3f_sync_ua", "")
 
@@ -1298,45 +1287,8 @@ def _parse_hhmm(value):
     return None
 
 
-def _parse_cron_field(field, min_val, max_val):
-    """解析 cron 单字段，返回匹配值集合。支持 * /n a-b a,b,c。"""
-    result = set()
-    for part in field.split(","):
-        step = 1
-        if "/" in part:
-            part, step_s = part.split("/", 1)
-            step = int(step_s)
-        if part == "*":
-            start, end = min_val, max_val
-        elif "-" in part:
-            s, e = part.split("-", 1)
-            start, end = int(s), int(e)
-        else:
-            start = end = int(part)
-        for v in range(start, end + 1, step):
-            if min_val <= v <= max_val:
-                result.add(v)
-    return result
-
-
-def _cron_matches(expr, t):
-    """判断时间 t（time.struct_time）是否匹配 5 段 cron 表达式。"""
-    parts = expr.strip().split()
-    if len(parts) != 5:
-        return False
-    minute, hour, dom, month, dow = parts
-    return (t.tm_min in _parse_cron_field(minute, 0, 59)
-            and t.tm_hour in _parse_cron_field(hour, 0, 23)
-            and t.tm_mday in _parse_cron_field(dom, 1, 31)
-            and t.tm_mon in _parse_cron_field(month, 1, 12)
-            and (t.tm_wday + 1) % 7 in _parse_cron_field(dow, 0, 6))
-
-
 def _iface_restart_loop():
-    """定时重启接口线程：按界面选择的 HH:MM 每天重启一次。
-
-    旧配置没有 iface_restart_time 时，回退到 iface_restart_cron。
-    """
+    """定时重启接口线程：按界面选择的 HH:MM 每天重启一次。"""
     last_trigger = None
     while True:
         _load_global_cfg()
@@ -1345,14 +1297,7 @@ def _iface_restart_loop():
             # 用 (year, yday, hour, min) 去重，确保同一分钟只触发一次
             trigger_key = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min)
             restart_at = _parse_hhmm(IFACE_RESTART_TIME)
-            if restart_at is not None:
-                due = (now.tm_hour, now.tm_min) == restart_at
-            else:
-                try:
-                    due = _cron_matches(IFACE_RESTART_CRON, now)
-                except (ValueError, TypeError):
-                    # 旧配置的 cron 非法：跳过本次并继续轮询，不能让线程崩掉
-                    due = False
+            due = restart_at is not None and (now.tm_hour, now.tm_min) == restart_at
             if trigger_key != last_trigger and due:
                 last_trigger = trigger_key
                 accounts = _load_accounts()

@@ -226,7 +226,6 @@ def _write_uci(path, accounts, main_opts=None):
     lines.append("\toption interval '%s'" % main_opts.get("interval", "10"))
     lines.append("\toption iface_restart_enabled '0'")
     lines.append("\toption iface_restart_time '04:00'")
-    lines.append("\toption iface_restart_cron '0 4 * * *'")
     lines.append("")
     for i, acc in enumerate(accounts):
         name = acc.get("name")

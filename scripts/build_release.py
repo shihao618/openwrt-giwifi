@@ -17,9 +17,9 @@ LuCI 包使用官方的 luci.mk，因此 SDK 中必须先安装 LuCI feed：
   python3 scripts/build_release.py --sdk /path/to/sdk --dist dist --clean
 
 产物:
-  dist/giwifi-auth_<ver>-r<rel>_all.apk        （或 .ipk，取决于 SDK）
-  dist/luci-app-giwifi_<ver>-r<rel>_all.apk    （或 .ipk）
-  dist/luci-i18n-giwifi-zh-cn-*.apk          （或 .ipk）
+  dist/giwifi-auth_<ver>-r<rel>_all.apk
+  dist/luci-app-giwifi_<ver>-r<rel>_all.apk
+  dist/luci-i18n-giwifi-zh-cn-*.apk
   dist/openwrt-giwifi-<ver>.zip                （源码包）
 """
 import glob
@@ -40,7 +40,7 @@ UI_VIEW = os.path.join(ROOT, "luci-app-giwifi", "htdocs", "luci-static",
                        "resources", "view", "network", "giwifi.js")
 
 # 排除项（打包源码 zip 时跳过）
-SKIP_DIRS = {"dist", "__pycache__", ".git", ".pytest_cache",
+SKIP_DIRS = {"dist", "artifacts", "__pycache__", ".git", ".pytest_cache",
              ".github", ".vscode", ".idea", ".work"}
 SKIP_EXT = {".pyc", ".pyo"}
 
@@ -173,6 +173,21 @@ def run_make(sdk, targets):
         _fail("SDK 编译失败（退出码 %d），请查看上方日志。" % e.returncode)
 
 
+def clean_sdk_build_dirs(sdk):
+    """Drop stale per-package build trees before compiling.
+
+    The post-build cleanup in luci.mk removes the copied htdocs tree but keeps
+    the .prepared stamp; reusing that tree makes the next build fail with
+    "htdocs/*: No such file or directory". Removing the tree forces a clean
+    Prepare step while keeping the SDK host tools intact.
+    """
+    for name in PKG_NAMES:
+        pattern = os.path.join(sdk, "build_dir", "target-*", "%s*" % name)
+        for path in glob.glob(pattern):
+            shutil.rmtree(path, ignore_errors=True)
+            print("  -> 清理旧构建目录: %s" % path)
+
+
 def clean_sdk_artifacts(sdk):
     """Remove previous artifacts of the same packages from the SDK.
 
@@ -180,33 +195,28 @@ def clean_sdk_artifacts(sdk):
     so a rebuild otherwise leaves multiple luci-i18n-*.apk files behind.
     """
     for name in PKG_NAMES + I18N_PKGS:
-        for ext in ("apk", "ipk"):
-            pattern = os.path.join(sdk, "bin", "packages", "**",
-                                   "%s[-_]*.%s" % (name, ext))
-            for path in glob.glob(pattern, recursive=True):
-                os.remove(path)
-                print("  -> 清理旧产物: %s" % path)
+        pattern = os.path.join(sdk, "bin", "packages", "**",
+                               "%s[-_]*.apk" % name)
+        for path in glob.glob(pattern, recursive=True):
+            os.remove(path)
+            print("  -> 清理旧产物: %s" % path)
 
 
 def collect_artifacts(sdk, dist):
-    """从 SDK 的 bin/packages 收集两个包及中文翻译包的产物（apk 或 ipk）。"""
+    """从 SDK 的 bin/packages 收集两个包及中文翻译包的 apk 产物。"""
     found = []
     for name in PKG_NAMES + I18N_PKGS:
-        for ext in ("apk", "ipk"):
-            # apk 产物名 <name>-<ver>-r<rel>.apk（连字符）；
-            # ipk 产物名 <name>_<ver>_<arch>.ipk（下划线）。
-            pat = os.path.join(sdk, "bin", "packages", "**",
-                               "%s[-_]*.%s" % (name, ext))
-            found.extend(glob.glob(pat, recursive=True))
+        pat = os.path.join(sdk, "bin", "packages", "**",
+                           "%s[-_]*.apk" % name)
+        found.extend(glob.glob(pat, recursive=True))
     found = sorted(set(found))
     if not found:
         _fail("SDK 未产出 %s 包，请检查编译日志。"
               % " / ".join(PKG_NAMES + I18N_PKGS))
     os.makedirs(dist, exist_ok=True)
     for name in PKG_NAMES + I18N_PKGS:
-        for ext in ("apk", "ipk"):
-            for old in glob.glob(os.path.join(dist, "%s[-_]*.%s" % (name, ext))):
-                os.remove(old)
+        for old in glob.glob(os.path.join(dist, "%s[-_]*.apk" % name)):
+            os.remove(old)
     out = []
     for f in found:
         target = os.path.join(dist, os.path.basename(f))
@@ -289,6 +299,7 @@ def main():
     # ships the target toolchain); the resulting packages are still produced
     # by the official package.mk/luci.mk machinery.
     clean_sdk_artifacts(sdk)
+    clean_sdk_build_dirs(sdk)
 
     for name in PKG_NAMES:
         run_make(sdk, ["-C", os.path.join(sdk, "package", name),

@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=giwifi-auth
-PKG_VERSION:=1.4.0
-PKG_RELEASE:=6
+PKG_VERSION:=2.0.0
+PKG_RELEASE:=1
 
 PKG_MAINTAINER:=yangxingyu <1767274678@qq.com>
 PKG_LICENSE:=MIT
@@ -33,21 +33,18 @@ endef
 define Build/Compile
 endef
 
-# User configuration is preserved across opkg/apk upgrades.
+# User configuration is preserved across apk upgrades.
 define Package/giwifi-auth/conffiles
 /etc/config/giwifi-auth
 endef
 
-# Start policy:
-#   apk: a fresh install or reinstall does not start the service; post-upgrade
-#        preserves the previous state and restarts it.
-#   opkg: a fresh install does not start the service; an upgrade ($1 non-empty)
-#        preserves the previous state and restarts it.
+# Start policy: a fresh apk install does not start the service; post-upgrade
+# preserves the previous enabled state and restarts the instance.
 define Package/giwifi-auth/postinst
 #!/bin/sh
 [ "$${IPKG_NO_SCRIPT:-0}" = "1" ] && exit 0
 [ -n "$${IPKG_INSTROOT}" ] && [ "$${IPKG_INSTROOT}" != "/" ] && exit 0
-if [ "$${PKG_UPGRADE:-0}" = "1" ] || { [ ! -f /lib/apk/db/installed ] && [ -n "$$1" ]; }; then
+if [ "$${PKG_UPGRADE:-0}" = "1" ]; then
     if [ "$$(uci get giwifi-auth.main.enabled 2>/dev/null)" = "1" ]; then
         /etc/init.d/giwifi-auth enable 2>/dev/null || true
         if uci show giwifi-auth 2>/dev/null | grep -q "^giwifi-auth\..*=account"; then

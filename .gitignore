@@ -1,8 +1,5 @@
-# Build artifacts (attach these to a release instead of committing them)
+# SDK build output (committed release files live in artifacts/)
 dist/
-*.apk
-*.ipk
-*.zip
 
 # Python bytecode
 __pycache__/

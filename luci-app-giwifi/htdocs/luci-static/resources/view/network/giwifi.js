@@ -31,7 +31,7 @@ const DEVICE_TYPES = [
 	[ 'android', 'Android' ]
 ];
 
-const VERSION = '1.4.0';
+const VERSION = '2.0.0';
 
 /* Query procd service state through ubus, the authoritative source. */
 const callServiceList = rpc.declare({
@@ -353,18 +353,12 @@ return view.extend({
 		o.default = '04:00';
 		o.rmempty = false;
 		o.description = _('Local time on the router');
-		const timeValues = {};
 		for (let hour = 0; hour < 24; hour++) {
 			for (let minute = 0; minute < 60; minute += 15) {
 				const value = ('0' + hour).slice(-2) + ':' + ('0' + minute).slice(-2);
-				timeValues[value] = true;
 				o.value(value, value);
 			}
 		}
-		const configuredTime = uci.get('giwifi-auth', 'main', 'iface_restart_time');
-		if (configuredTime && /^[0-9]{1,2}:[0-9]{2}$/.test(configuredTime) &&
-		    !timeValues[configuredTime])
-			o.value(configuredTime, configuredTime);
 
 		o = s2.option(form.ListValue, 'ua3f_sync_ua', _('UA3F terminal type synchronization'));
 		o.value('', _('Do not synchronize (leave UA3F unchanged)'));
