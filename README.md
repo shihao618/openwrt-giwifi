@@ -11,6 +11,7 @@
 openwrt-giwifi/
 ├── artifacts/                    # 随代码发布的预构建 apk / 源码包
 ├── install.sh                    # 一键安装脚本（分别复制后端与 LuCI 界面）
+├── install-online.sh             # GitHub 在线一键安装（下载 artifacts 后 apk add）
 ├── giwifi-auth/                  # 后端包：认证程序 + 守护 + UCI 配置
 │   ├── Makefile                  # OpenWrt 包定义（PKGARCH:=all）
 │   └── files/
@@ -69,6 +70,32 @@ apk add giwifi-auth luci-app-giwifi luci-i18n-giwifi-zh-cn
 ```
 
 如果只用 `install.sh` 手动安装，脚本会自动处理后端 Python 依赖；LuCI 基础包需固件自带。
+
+## GitHub 一键安装（OpenWrt 25.12 / apk）
+
+在路由器上直接执行：
+
+```sh
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | sh
+```
+
+或：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | sh
+```
+
+脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
+
+```sh
+# 固定使用 v2.0.0 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.0.0 sh
+
+# 自定义 artifact 镜像前缀
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
+```
+
+> 这是 `apk` 系统专用的一键安装，适用于 OpenWrt 25.12；执行前可以先下载脚本查看内容。
 
 ## 快速安装（免编译，直接传文件）
 
