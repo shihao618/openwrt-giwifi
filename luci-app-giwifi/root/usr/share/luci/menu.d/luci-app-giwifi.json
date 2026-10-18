@@ -1,0 +1,14 @@
+{
+	"admin/network/giwifi": {
+		"title": "GiWiFi Authentication",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "network/giwifi"
+		},
+		"depends": {
+			"acl": [ "luci-app-giwifi" ],
+			"uci": { "giwifi-auth": true }
+		}
+	}
+}

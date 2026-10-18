@@ -1,0 +1,19 @@
+# Build artifacts (attach these to a release instead of committing them)
+dist/
+*.apk
+*.ipk
+*.zip
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# DSH workspace metadata
+.merkle-snapshot.json
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/

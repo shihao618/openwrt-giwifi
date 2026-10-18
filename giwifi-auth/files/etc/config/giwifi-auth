@@ -1,0 +1,12 @@
+config giwifi 'main'
+	option enabled '0'
+	option base_url 'http://10.189.1.3'
+	option interval '30'
+	option iface_restart_enabled '0'
+	option iface_restart_time '04:00'
+	option iface_restart_cron '0 4 * * *'
+	option ua3f_sync_ua ''
+
+# 以下两个空段仅用于 LuCI 的“运行状态 / 日志”选项卡，无配置项。
+config status 'status'
+config log 'log'

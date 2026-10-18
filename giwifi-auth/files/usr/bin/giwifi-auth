@@ -1,0 +1,1505 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""giwifi-auth — GiWiFi 校园网自动登录（OpenWrt 版，多账号，纯标准库，headless）。
+
+子命令:
+  giwifi-auth login [name]     立即登录（不指定 name 则登录所有已启用账号）
+  giwifi-auth logout [name]    注销下线（不指定 name 则注销所有账号）
+  giwifi-auth status           查询所有账号在线状态与在线时长
+  giwifi-auth check            检查所有账号在线状态（0=全部在线, 1=有掉线, 2=异常）
+  giwifi-auth log              查看最近 50 条本地认证日志
+  giwifi-auth sync-ua3f        保存配置时调用：把全局 UA3F UA 同步给 ua3f 插件
+  giwifi-auth check-config     保存后校验：接口唯一性（0=通过, 1=重复绑定）
+  giwifi-auth run              多线程守护：每账号独立轮询，掉线自动重登
+
+配置文件 /etc/config/giwifi-auth（UCI 格式）:
+  config giwifi 'main'          全局配置
+    option enabled '0/1'        启用守护
+    option base_url '...'       Portal 基地址
+    option interval '30'        轮询间隔秒
+    option iface_restart_enabled '0/1'   定时重启接口开关
+    option iface_restart_time '04:00'   每天重启接口的时间（HH:MM）
+    option iface_restart_cron '0 4 * * *' 兼容旧版的 cron 回退
+    option ua3f_sync_ua ''      同步给 UA3F 的终端类型（windows/ipad/iphone/android；空则不动 UA3F；保存时同步）
+  config account 'name'         单个账号（可多个）
+    option enabled '0/1'        启用该账号
+    option interface 'eth0'     绑定的网络接口（认证请求从此接口发出）
+    option username '...'       账号
+    option password '...'       密码
+    option device_type 'windows' 终端类型: ipad/iphone/windows/android
+    option device_ua '...'      自定义 UA（非空时优先于终端类型）
+    option auto_rebind '0/1'    自动换绑 MAC
+
+环境变量:
+  GIWIFI_UCI_PATH  覆盖 UCI 配置文件路径（测试用，默认 /etc/config/giwifi-auth）
+
+协议：Web authLogin JS 流
+  GET /gportal/web/login -> 解析 #frmLogin -> AES-128-CBC(ZeroPadding)
+  POST /gportal/web/authLogin?round=N {data, iv}  -> status==1 成功
+  在线判定: POST /gportal/web/queryAuthState {userIp, sign} -> status==1 在线
+"""
+import os
+import sys
+import re
+import json
+import time
+import base64
+import random
+import socket
+import struct
+import html.parser
+import urllib.parse
+import http.client
+import subprocess
+import threading
+
+WEB_AES_KEY = b"1234567887654321"
+LOGIN_PATH = "/gportal/web/login?has_reload=1&pagetype=login&logintype=1"
+
+# 本地认证日志：滚动保留最近 LOG_KEEP 条，超过 LOG_TRIM 条时裁剪。
+# GIWIFI_LOG_PATH 仅用于测试/调试（与 GIWIFI_UCI_PATH 同一约定）。
+LOG_PATH = os.environ.get("GIWIFI_LOG_PATH", "/var/log/giwifi-auth.log")
+LOG_KEEP = 50
+LOG_TRIM = 100
+_BEIJING_OFFSET_SECONDS = 8 * 3600
+
+# ---------------------------------------------------------------------------
+# 配置：直接读取 UCI 文件（/etc/config/giwifi-auth）。
+# main section 为全局参数，多个 account section 为各自绑定接口的账号。
+# ---------------------------------------------------------------------------
+_UCI_PATH = os.environ.get("GIWIFI_UCI_PATH", "/etc/config/giwifi-auth")
+_UCI_CONF = os.path.basename(_UCI_PATH)  # UCI 包名，用于 uci CLI 反查
+
+# Linux 接口名安全字符集：用于拒绝路径穿越/选项注入类配置值。
+_IFACE_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
+
+
+def _valid_iface_name(iface):
+    return bool(iface) and not iface.startswith("-") and \
+        _IFACE_NAME_RE.match(iface) is not None
+
+
+def _load_uci_config(path=_UCI_PATH):
+    """解析 UCI 文件，返回 {section_name: {".type": 段类型, option: value}}。
+
+    按 UCI 语法处理引号与转义：
+      - 单引号值 `'a'\''b'` 还原为 `a'b`；
+      - 双引号值还原 `\"` 与 `\\`；
+      - 无引号值直接取用。
+    section 行形如 `config type 'name'`，name 作为键，type 存入 `".type"`。
+    匿名段（LuCI「添加账号」生成）形如 `config type`（**无段名**，落盘时 libuci 不写名字），
+    必须同样解析并按 `@type[序号]` 命名，否则整段会被丢弃、插件看不到该账号。
+    """
+    sections = {}
+    cur = None
+    anon_seq = {}
+    if not os.path.exists(path):
+        return sections
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"\s*config\s+(\S+)\s+['\"]?(\S+)['\"]?\s*$", line)
+                if m:
+                    cur = m.group(2).strip("'\"")
+                    sec = sections.setdefault(cur, {})
+                    sec[".type"] = m.group(1).strip("'\"")
+                    continue
+                m = re.match(r"\s*config\s+(\S+)\s*$", line)
+                if m:
+                    sec_type = m.group(1).strip("'\"")
+                    idx = anon_seq.get(sec_type, 0)
+                    while "@%s[%d]" % (sec_type, idx) in sections:
+                        idx += 1
+                    anon_seq[sec_type] = idx + 1
+                    cur = "@%s[%d]" % (sec_type, idx)
+                    sec = sections.setdefault(cur, {})
+                    sec[".type"] = sec_type
+                    continue
+                m = re.match(r"\s*option\s+([^\s]+)\s+(.*?)\s*$", line)
+                if m and cur is not None:
+                    val = m.group(2).strip()
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+                        quote = val[0]
+                        val = val[1:-1]
+                        if quote == "'":
+                            val = val.replace("'\\''", "'")
+                        else:
+                            val = val.replace('\\"', '"').replace("\\\\", "\\")
+                    sections[cur][m.group(1)] = val
+    except (OSError, UnicodeDecodeError):
+        pass
+    return sections
+
+
+def _register_idna_fallback():
+    """OpenWrt python3-light 拆包缺 encodings.idna（无 python3-encodings 包）。
+    Python 3.13 的 socket.getaddrinfo 会无条件对主机名执行 encode('idna')，
+    缺失时任何网络连接都抛 LookupError。注册最小 idna 兼容编码
+    （仅处理 ASCII 主机名/IP，足够本脚本使用）。"""
+    try:
+        "a".encode("idna")
+        return  # 系统已提供 idna
+    except LookupError:
+        pass
+
+    def _enc(s, errors="strict"):
+        if errors != "strict":
+            raise LookupError("idna fallback 仅支持 strict")
+        return s.encode("ascii"), len(s)
+
+    def _dec(b, errors="strict"):
+        if errors != "strict":
+            raise LookupError("idna fallback 仅支持 strict")
+        return b.decode("ascii"), len(b)
+
+    import codecs as _codecs
+    _codecs.register(
+        lambda name: _codecs.CodecInfo(name="idna", encode=_enc, decode=_dec)
+        if name == "idna" else None)
+
+
+_register_idna_fallback()
+
+# 终端类型 -> UA 预设（均走 Web authLogin 流）
+_UA_IPAD = ("Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.5 Mobile/15E148 Safari/604.1")
+UA_PRESETS = {
+    "ipad": _UA_IPAD,
+    "iphone": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+               "Version/17.5 Mobile/15E148 Safari/604.1"),
+    "windows": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"),
+    "android": ("Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36"),
+}
+
+# ---------------------------------------------------------------------------
+# 多账号配置模型
+#   main section: 全局参数（base_url / interval / 定时重启接口）
+#   account section: 每个账号绑定一个网络接口，独立认证
+# ---------------------------------------------------------------------------
+
+class Account:
+    """单个校园网账号：绑定一个网络接口，独立认证。"""
+
+    def __init__(self, name, interface, username, password,
+                 device_type="windows", device_ua="", auto_rebind=False,
+                 enabled=True):
+        self.name = name
+        self.interface = interface
+        self.username = username
+        self.password = password
+        self.device_type = device_type
+        self.device_ua = device_ua
+        self.auto_rebind = auto_rebind
+        self.enabled = enabled
+        self.mac = _get_iface_mac(interface)
+        # 自定义 UA 非空时优先生效，否则按终端类型预设
+        self.ua = device_ua or UA_PRESETS.get(device_type, UA_PRESETS["windows"])
+
+    def __repr__(self):
+        return "Account(%s iface=%s user=%s)" % (
+            self.name, self.interface, _mask_account(self.username))
+
+
+def _get_iface_mac(iface):
+    """获取指定网络接口的 MAC 地址，失败返回空串。"""
+    if not _valid_iface_name(iface):
+        return ""
+    try:
+        with open("/sys/class/net/%s/address" % iface) as f:
+            mac = f.read().strip()
+        if mac and mac.lower() != "00:00:00:00:00:00":
+            return mac
+    except OSError:
+        pass
+    return ""
+
+
+def _iface_ipv4(iface):
+    """读取接口当前 IPv4 地址（ioctl SIOCGIFADDR），失败返回空串。
+
+    SO_BINDTODEVICE 只决定出接口，源地址仍由全局路由表挑选：mwan3 多 WAN 下
+    本机发出的包会落到 main 表，默认路由 metric 偏斜到别的 WAN，导致源地址与
+    出接口不一致、认证流量被上游丢弃。显式绑定该接口的源 IPv4 可避免此问题。
+    仅 Linux 提供 fcntl/SIOCGIFADDR；其他平台（如测试环境）或接口无地址时返回
+    空串，调用方退化为「只绑定出接口」的旧行为。"""
+    if not _valid_iface_name(iface):
+        return ""
+    try:
+        import fcntl
+    except ImportError:
+        return ""
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        req = struct.pack("256s", iface[:15].encode("utf-8"))
+        res = fcntl.ioctl(sock.fileno(), 0x8915, req)  # SIOCGIFADDR
+        return socket.inet_ntoa(res[20:24])
+    except OSError:
+        return ""
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def _iface_ready(iface):
+    """检查绑定接口是否可用于认证：存在且有 IPv4 地址。
+
+    返回 (ready, reason)：ready=True 时 reason 为空串；否则给出简短原因。
+    iface 为空（未绑定接口）时视为就绪——沿用「由系统默认出口发包」的旧行为。
+    多网口/单网口、有无 mwan3 都适用：mwan3 成员未 DHCP 到地址、或接口未 up
+    时提前拦截，避免发无谓的认证请求并让日志可解释。"""
+    if not iface:
+        return True, ""
+    if not _valid_iface_name(iface):
+        return False, "接口名非法"
+    if not os.path.exists("/sys/class/net/%s" % iface):
+        return False, "接口 %s 不存在" % iface
+    if not _iface_ipv4(iface):
+        return False, "接口 %s 尚无 IPv4 地址（未 DHCP 或未 up）" % iface
+    return True, ""
+
+
+# 运行期全局配置（main section）
+BASE_URL = "http://10.189.1.3"
+INTERVAL = 30
+IFACE_RESTART_ENABLED = False
+IFACE_RESTART_TIME = ""
+IFACE_RESTART_CRON = "0 4 * * *"
+ENABLED = True
+UA3F_SYNC_UA = ""  # 全局配置：同步给 UA3F 的 UA（空则不动 UA3F）
+
+# UA3F 作用于路由器全局转发流量（ua3f.main.ua 为单值），无法按接口区分，
+# 故其 UA 独立于各账号的认证 UA，且仅在保存配置时同步一次（见 sync-ua3f 子命令）。
+
+
+def _pick_opt(section, key, default):
+    """从 UCI section 字典取值，空值回退默认值。"""
+    v = section.get(key)
+    if v is not None and v != "":
+        return v
+    return default
+
+
+def _load_global_cfg():
+    """加载 main section 全局配置。"""
+    global BASE_URL, INTERVAL, IFACE_RESTART_ENABLED, IFACE_RESTART_TIME, \
+        IFACE_RESTART_CRON, ENABLED, UA3F_SYNC_UA
+    sections = _load_uci_config()
+    # 全局配置所在的 section 类型为 giwifi（约定名 main），按名称优先定位，
+    # 避免界面占位段 status/log 排在前面时被误读。
+    main = sections.get("main") if sections.get("main", {}).get(".type") == "giwifi" else {}
+    if not main:
+        for _sec in sections.values():
+            if _sec.get(".type") == "giwifi":
+                main = _sec
+                break
+    BASE_URL = _pick_opt(main, "base_url", "http://10.189.1.3").rstrip("/")
+    try:
+        INTERVAL = int(_pick_opt(main, "interval", "30"))
+    except ValueError:
+        INTERVAL = 30
+    if INTERVAL < 10:
+        INTERVAL = 10
+    IFACE_RESTART_ENABLED = _pick_opt(main, "iface_restart_enabled", "0").lower() in ("1", "true", "yes", "on")
+    IFACE_RESTART_TIME = _pick_opt(main, "iface_restart_time", "")
+    # 旧配置只有 cron 表达式；新界面使用 iface_restart_time，cron 仅作回退。
+    IFACE_RESTART_CRON = _pick_opt(main, "iface_restart_cron", "0 4 * * *")
+    ENABLED = _pick_opt(main, "enabled", "0").lower() in ("1", "true", "yes", "on")
+    UA3F_SYNC_UA = _pick_opt(main, "ua3f_sync_ua", "")
+
+
+def _load_accounts():
+    """加载所有 account section，返回 Account 列表（仅含已启用的）。
+    接口唯一：同一接口只能被一个账号绑定，重复绑定的后来者跳过并告警。"""
+    sections = _load_uci_config()
+    accounts = []
+    iface_owner = {}
+    for name, sec in sections.items():
+        if sec.get(".type") != "account":
+            continue  # 只处理 account section（跳过 main 等非账号段）
+        if _pick_opt(sec, "enabled", "1").lower() not in ("1", "true", "yes", "on"):
+            continue
+        iface = sec.get("interface", "")
+        username = sec.get("username", "")
+        password = sec.get("password", "")
+        if not username or not password:
+            continue  # 账号密码不完整跳过
+        if iface and not _valid_iface_name(iface):
+            print("[giwifi-auth] 账号 %s 的接口名非法，跳过" % name, flush=True)
+            continue
+        if iface and iface in iface_owner:
+            print("[giwifi-auth] 接口 %s 已被账号 %s 绑定，跳过账号 %s"
+                  "（同一接口不可被多个账号绑定）"
+                  % (iface, iface_owner[iface], name), flush=True)
+            continue
+        if iface:
+            iface_owner[iface] = name
+        acc = Account(
+            name=name,
+            interface=iface,
+            username=username,
+            password=password,
+            device_type=_pick_opt(sec, "device_type", "windows").lower(),
+            device_ua=sec.get("device_ua", ""),
+            auto_rebind=_pick_opt(sec, "auto_rebind", "0").lower() in ("1", "true", "yes", "on"),
+            enabled=True,
+        )
+        accounts.append(acc)
+    return accounts
+
+
+def cmd_check_config():
+    """接口唯一性校验：同一接口只能被一个账号绑定。
+    打印所有冲突；返回 0=无冲突, 1=存在冲突（供 LuCI 保存后校验调用）。"""
+    _refresh_cfg()
+    sections = _load_uci_config()
+    iface_owner = {}
+    conflicts = []
+    for name, sec in sections.items():
+        if sec.get(".type") != "account":
+            continue  # 只处理 account section（跳过 main 等非账号段）
+        iface = sec.get("interface", "")
+        if not iface:
+            continue
+        if iface in iface_owner:
+            conflicts.append((iface, iface_owner[iface], name))
+        else:
+            iface_owner[iface] = name
+    for iface, a, b in conflicts:
+        print("接口 %s 同时被账号 %s 与 %s 绑定" % (iface, a, b), flush=True)
+    return 1 if conflicts else 0
+
+
+def _refresh_cfg(stop_if_disabled=False):
+    """刷新全局配置；stop_if_disabled 时若全局禁用则停止守护。"""
+    _load_global_cfg()
+    if stop_if_disabled and not ENABLED:
+        print("[giwifi-auth] 配置已禁用（enabled=0），停止守护", flush=True)
+        try:
+            subprocess.run(["/etc/init.d/giwifi-auth", "stop"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+        os._exit(0)
+
+
+def _sync_ua3f():
+    """把全局配置 ua3f_sync_ua 同步到 UA3F（若已安装且值不同，则 set + commit + restart）。
+    ua3f_sync_ua 为终端类型键（windows/ipad/iphone/android），经 UA_PRESETS 映射为完整 UA；
+    若填的已是完整 UA 字符串（含空格），则兼容旧值直接使用。取值为空则完全不动 UA3F。
+    仅在保存配置时调用一次（见 sync-ua3f 子命令）。"""
+    raw = UA3F_SYNC_UA
+    if not raw:
+        return
+    ua = UA_PRESETS.get(raw, raw)  # 键则映射为预设 UA，否则按完整 UA 字符串使用
+    try:
+        p = subprocess.run(["uci", "get", "ua3f.main.ua"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return
+    if p.returncode != 0 or not p.stdout.strip():
+        return  # ua3f 未安装或未配置，跳过
+    cur = p.stdout.strip()
+    if cur == ua:
+        return  # 已一致，幂等
+    try:
+        subprocess.run(["uci", "set", "ua3f.main.ua=" + ua],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["uci", "commit", "ua3f"],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["/etc/init.d/ua3f", "restart"],
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        return
+    print("UA3F 联动: UA 已同步为终端类型 %s" % raw if raw in UA_PRESETS
+          else "UA3F 联动: UA 已同步", flush=True)
+
+
+_refresh_cfg()
+
+
+# ---------------------------------------------------------------------------
+# 纯 Python AES-128（与桌面脚本同一实现，已实测）
+# 密钥固定为 WEB_AES_KEY，round_keys 在模块加载时预计算一次。
+# ---------------------------------------------------------------------------
+_AES_SBOX = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+]
+_AES_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+_AES_NK = 4   # AES-128 密钥字数
+_AES_NR = 10  # AES-128 轮数
+
+
+def _aes_key_expansion(key):
+    if len(key) != 16:
+        raise ValueError("AES-128 需要 16 字节密钥")
+    words = [int.from_bytes(key[i:i + 4], "big") for i in range(0, 16, 4)]
+    for i in range(_AES_NK, 4 * (_AES_NR + 1)):
+        temp = words[i - 1]
+        if i % _AES_NK == 0:
+            rot = ((temp << 8) | (temp >> 24)) & 0xFFFFFFFF
+            sub = sum(
+                (_AES_SBOX[(rot >> shift) & 0xFF] << shift)
+                for shift in (24, 16, 8, 0)
+            )
+            temp = sub ^ (_AES_RCON[i // _AES_NK - 1] << 24)
+        words.append(words[i - _AES_NK] ^ temp)
+    return b"".join(w.to_bytes(4, "big") for w in words)
+
+
+def _aes_gmul(a, b):
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return p
+
+
+def _aes_sub_bytes(state):
+    return [_AES_SBOX[b] for b in state]
+
+
+def _aes_shift_rows(state):
+    out = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[c * 4 + r] = state[((c + r) % 4) * 4 + r]
+    return out
+
+
+def _aes_mix_columns(state):
+    out = list(state)
+    for c in range(4):
+        col = state[c * 4:c * 4 + 4]
+        a0, a1, a2, a3 = col
+        out[c * 4 + 0] = _aes_gmul(a0, 2) ^ _aes_gmul(a1, 3) ^ a2 ^ a3
+        out[c * 4 + 1] = a0 ^ _aes_gmul(a1, 2) ^ _aes_gmul(a2, 3) ^ a3
+        out[c * 4 + 2] = a0 ^ a1 ^ _aes_gmul(a2, 2) ^ _aes_gmul(a3, 3)
+        out[c * 4 + 3] = _aes_gmul(a0, 3) ^ a1 ^ a2 ^ _aes_gmul(a3, 2)
+    return out
+
+
+def _aes_add_round_key(state, round_keys, round_no):
+    start = round_no * 16
+    return [state[i] ^ round_keys[start + i] for i in range(16)]
+
+
+def aes_encrypt_block(block, round_keys):
+    state = list(block)
+    state = _aes_add_round_key(state, round_keys, 0)
+    for r in range(1, _AES_NR):
+        state = _aes_sub_bytes(state)
+        state = _aes_shift_rows(state)
+        state = _aes_mix_columns(state)
+        state = _aes_add_round_key(state, round_keys, r)
+    state = _aes_sub_bytes(state)
+    state = _aes_shift_rows(state)
+    state = _aes_add_round_key(state, round_keys, _AES_NR)
+    return bytes(state)
+
+
+def _zero_pad(data):
+    remainder = len(data) % 16
+    if remainder == 0:
+        return data
+    return data + bytes(16 - remainder)
+
+
+# WEB_AES_KEY 是模块级固定常量，round_keys 预计算一次，避免每次加密重复展开。
+_WEB_ROUND_KEYS = _aes_key_expansion(WEB_AES_KEY)
+
+
+def aes_cbc_encrypt(data, key, iv):
+    """AES-128-CBC，zero-padding（与 Web Portal 一致）。
+    key 为 WEB_AES_KEY 时直接复用预计算的 round_keys。"""
+    round_keys = _WEB_ROUND_KEYS if key is WEB_AES_KEY else _aes_key_expansion(key)
+    padded = _zero_pad(data)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(padded), 16):
+        block = bytes(x ^ y for x, y in zip(padded[i:i + 16], prev))
+        enc = aes_encrypt_block(block, round_keys)
+        out += enc
+        prev = enc
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# URL 编码 / 表单解析（复刻 JS encodeURIComponent 与 jQuery serialize）
+# ---------------------------------------------------------------------------
+# encodeURIComponent 的安全字符集（RFC 3986 unreserved + 子分隔符），
+# 提到模块级避免每次调用重建 set。
+_URI_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()")
+
+
+def encode_uri_component(value):
+    out = []
+    for b in value.encode("utf-8"):
+        c = chr(b)
+        out.append(c if c in _URI_SAFE else "%%%02X" % b)
+    return "".join(out)
+
+
+class _FormInputParser(html.parser.HTMLParser):
+    """解析表单 <input> 字段，同时支持「全量列表」与「首个值字典」两种模式。
+
+    mode="list"  ：按出现顺序收集每个 input 的 name/value/type/checked
+                   （用于复刻 jQuery serialize，需保留顺序与勾选状态）。
+    mode="first" ：每个 name 只保留首次出现的 value（用于抓登录页隐藏字段，
+                   避免重复字段覆盖，且无需关心 type/checked）。
+    """
+
+    def __init__(self, mode="list"):
+        super().__init__()
+        self._mode = mode
+        self.inputs = []        # mode="list" 时填充
+        self.fields = {}        # mode="first" 时填充
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "input":
+            return
+        attr = {k.lower(): v for k, v in attrs}
+        name = attr.get("name")
+        if not name:
+            return
+        value = attr.get("value") or ""
+        if self._mode == "first":
+            if name not in self.fields:
+                self.fields[name] = value
+            return
+        self.inputs.append({
+            "name": name,
+            "value": value,
+            "type": attr.get("type", "text").lower(),
+            "checked": "checked" in attr,
+        })
+
+
+def _parse_login_page(html_text):
+    """抓登录页隐藏字段：每个 name 取首次出现值（与旧 _HiddenInputParser 行为一致）。"""
+    p = _FormInputParser(mode="first")
+    p.feed(html_text)
+    return p.fields
+
+
+def _parse_login_form(page_html):
+    """从登录页 HTML 解析 #frmLogin 表单，返回 (inputs, text_cred, pwd_cred, iv)。
+
+    inputs: 按出现顺序的 input 字典列表（含 name/value/type/checked）
+    text_cred/pwd_cred: 账号/密码输入框的 name
+    iv: AES IV（16 字节字符串）
+    """
+    # 协议耦合点：Portal JS 形如 cryptoEncode($("#frmLogin").serialize())。
+    # 若 Portal 改版导致此处匹配失败，会回退到默认 #frmLogin。
+    m = re.search(
+        r'cryptoEncode\s*\(\s*\$\(\s*["\']#(\w+)["\']\s*\)\s*\.serialize\(\)\s*\)',
+        page_html, re.I)
+    form_id = m.group(1) if m else "frmLogin"
+    fm = re.search(
+        r'<form[^>]*id="%s"[^>]*>.*?</form>' % re.escape(form_id),
+        page_html, re.I | re.S)
+    if not fm:
+        raise RuntimeError("未找到登录表单 #%s" % form_id)
+    p = _FormInputParser()
+    p.feed(fm.group(0))
+    inputs = p.inputs
+
+    text_cred = ""
+    pwd_cred = ""
+    for inp in inputs:
+        if inp["type"] == "password" and not pwd_cred:
+            pwd_cred = inp["name"]
+        elif (inp["type"] in ("text", "tel", "email", "number")
+              and not text_cred):
+            text_cred = inp["name"]
+
+    iv = dict((i["name"], i["value"]) for i in inputs).get("iv", "")
+    if len(iv) != 16:
+        raise RuntimeError("iv 长度异常: %d" % len(iv))
+    return inputs, text_cred, pwd_cred, iv
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=None):
+    """HTTP 请求；iface 非空时绑定指定网络接口发包（SO_BINDTODEVICE），
+    并同时绑定该接口的源 IPv4 地址，确保 mwan3 多 WAN 下走对出口、选对源地址。"""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port or 443,
+                                           timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80,
+                                          timeout=timeout)
+    if iface:
+        # SO_BINDTODEVICE 必须在 connect 之前设置，才能让 TCP 包从指定接口发出。
+        # 通过替换 http.client 内部的 _create_connection 钩子实现：HTTP 与 HTTPS
+        # 的 connect() 都会经由该钩子创建底层 socket，HTTPS 随后仍会正常完成 TLS
+        # 包装。（不能直接替换 conn.connect()，否则 HTTPS 会退化成明文连接。）
+        # 注意：SO_BINDTODEVICE 是 Linux 特有，非 Linux 平台（如测试环境）跳过绑定。
+        # mwan3 多 WAN：SO_BINDTODEVICE 只决定出接口，源地址仍由全局路由表挑选，
+        # main 表默认路由 metric 偏斜会让本机发出的包选错源地址而认证失败；
+        # 再显式 bind 该接口的源 IPv4，保证认证流量严格从绑定接口发出。
+        so_bindtodevice = getattr(socket, "SO_BINDTODEVICE", None)
+        src_ip = _iface_ipv4(iface)
+        default_timeout = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT", None)
+
+        def _create_connection(address, timeout=None, source_address=None):
+            host, port = address
+            err = None
+            for family, socktype, proto, _canonname, sockaddr in socket.getaddrinfo(
+                    host, port, 0, socket.SOCK_STREAM):
+                sock = None
+                try:
+                    sock = socket.socket(family, socktype, proto)
+                    if timeout is not None and timeout is not default_timeout:
+                        sock.settimeout(timeout)
+                    if so_bindtodevice is not None:
+                        sock.setsockopt(socket.SOL_SOCKET, so_bindtodevice,
+                                        iface.encode())
+                    if src_ip and family == socket.AF_INET:
+                        sock.bind((src_ip, 0))
+                    sock.connect(sockaddr)
+                    return sock
+                except OSError as exc:
+                    err = exc
+                    if sock is not None:
+                        sock.close()
+            raise err or OSError("无法解析主机 %s" % host)
+
+        conn._create_connection = _create_connection
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        rh = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, rh, data
+    finally:
+        conn.close()
+
+
+def _fetch_login_page(ua, iface=None):
+    url = urllib.parse.urljoin(BASE_URL, LOGIN_PATH)
+    # 抓登录页/会话查询是"浏览器行为"：自定义 UA 若非有效浏览器 UA（如"666"），
+    # Portal 的 nginx 会直接 403 拒登，此时自动回退 Windows 预设 UA 重试。
+    _fallback = UA_PRESETS["windows"]
+    for cur_ua in ((ua, _fallback) if ua != _fallback else (ua,)):
+        status, headers, body = http_request(
+            url, "GET", headers={"User-Agent": cur_ua}, timeout=10, iface=iface)
+        if status == 403:
+            continue
+        if not (200 <= status < 300):
+            raise RuntimeError("获取登录页失败 HTTP %d" % status)
+        sid = ""
+        m = re.search(r"PHPSESSID=([^;, \s]+)",
+                      headers.get("set-cookie", ""), re.IGNORECASE)
+        if m:
+            sid = m.group(1)
+        return sid, body.decode("utf-8", "replace")
+    raise RuntimeError("获取登录页失败 HTTP 403（所选 UA 被 Portal 拒绝）")
+
+
+def _login_headers(login_url, sid, ua):
+    hdrs = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": login_url,
+        "User-Agent": ua,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if sid:
+        hdrs["Cookie"] = "PHPSESSID=%s" % sid
+    return hdrs
+
+
+class _Session:
+    """轻量会话：缓存 PHPSESSID 与最近解析的 (sign, userIp)。
+
+    在线轮询时避免每次全量抓登录页；字段超过 max_age 自动刷新。
+    每个 Account 持有独立的 _Session 实例。
+    """
+
+    def __init__(self, ua, iface=None, max_age=60.0):
+        self.ua = ua
+        self.iface = iface
+        self.sid = ""
+        self.sign = ""
+        self.user_ip = ""
+        self.fetched_at = 0.0
+        self.max_age = max_age
+
+    def ensure_fresh(self):
+        """返回 (sign, user_ip)，必要时重新抓登录页。"""
+        now = time.monotonic()
+        if (self.sign and self.user_ip
+                and now - self.fetched_at < self.max_age):
+            return self.sign, self.user_ip
+        sid, page_html = _fetch_login_page(self.ua, self.iface)
+        fields = _parse_login_page(page_html)
+        self.sid = sid or self.sid
+        self.sign = fields.get("sign", "")
+        self.user_ip = fields.get("userIp", "")
+        self.fetched_at = now
+        return self.sign, self.user_ip
+
+
+def do_login(account, sess=None):
+    """用指定账号登录一次。返回 (ok, info)。
+    authLogin 响应：{"data":{"resultCode":N,...},"info":"..."}——成功以
+    data.resultCode==1 判定（兼容顶层 status==1 的旧结构）。
+    开启 auto_rebind 且 Portal 返回换绑提示（resultCode==2 / info 含绑定关键词）时，
+    按真实协议处理：POST /gportal/web/reBindMac（同一表单加密）→ 成功后重新 authLogin 认证。"""
+    sid, page_html = _fetch_login_page(account.ua, account.interface)
+    if sess is not None:
+        sess.sid = sid
+    login_url = urllib.parse.urljoin(BASE_URL, LOGIN_PATH)
+    AUTH_URL = urllib.parse.urljoin(BASE_URL, "/gportal/web/authLogin")
+    REBIND_URL = urllib.parse.urljoin(BASE_URL, "/gportal/web/reBindMac")
+
+    inputs, text_cred, pwd_cred, iv = _parse_login_form(page_html)
+    local_mac = account.mac
+
+    def _post(url, user_mac=None):
+        parts = []
+        for inp in inputs:
+            t = inp["type"]
+            if t in ("button", "submit", "reset", "image"):
+                continue
+            if t in ("checkbox", "radio") and not inp["checked"]:
+                continue
+            if inp["name"] == pwd_cred:
+                val = account.password
+            elif inp["name"] == text_cred:
+                val = account.username
+            elif inp["name"] == "userMac":
+                # Portal 的 userMac：authLogin 用本机 MAC（模拟浏览器）；
+                # reBindMac 必须用上一步 authLogin 失败返回的 bindmac（旧绑定 MAC）。
+                val = user_mac if user_mac else local_mac
+            else:
+                val = inp["value"]
+            parts.append("%s=%s" % (inp["name"], encode_uri_component(val)))
+        plaintext = "&".join(parts)
+        encrypted = base64.b64encode(aes_cbc_encrypt(
+            plaintext.encode("utf-8"), WEB_AES_KEY, iv.encode("utf-8"))
+        ).decode("ascii")
+        action = url + "?round=%d" % random.randint(0, 999)
+        body = urllib.parse.urlencode({"data": encrypted, "iv": iv})
+        status, _, raw = http_request(
+            action, "POST", headers=_login_headers(login_url, sid, account.ua),
+            body=body, timeout=10, iface=account.interface)
+        if not (200 <= status < 300):
+            raise RuntimeError("登录请求失败 HTTP %d" % status)
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except (ValueError, TypeError):
+            raise RuntimeError("登录返回非 JSON: %s" % raw[:200])
+
+    def _result(dec):
+        """从 authLogin 响应提取 (是否成功, 结果码, 信息, 数据字典)。"""
+        d = dec.get("data") if isinstance(dec.get("data"), dict) else {}
+        rc = d.get("resultCode") if d else dec.get("status")
+        ok = (rc == 1) or (dec.get("status") == 1)
+        info = dec.get("info") or d.get("info") or ""
+        return ok, rc, info, d
+
+    dec = _post(AUTH_URL)
+    ok, rc, info, d = _result(dec)
+    if ok:
+        return True, info or "登录成功"
+
+    # 失败时打印原始响应，便于排查绑定/换绑类异常（含 bindmac 等字段）
+    print("[giwifi-auth] authLogin 原始响应: %s"
+          % json.dumps(dec, ensure_ascii=False)[:500], flush=True)
+
+    rc_code = d.get("reasoncode")
+    no_rebind_rc = rc_code in _NO_REBIND_RC
+    need_rebind = ((rc == 2 and rc_code == 43)
+                   or (_looks_like_bind_hint(info) and not no_rebind_rc))
+    if account.auto_rebind and need_rebind:
+        bindmac = d.get("bindmac", "")
+        if not bindmac:
+            return False, ("换绑失败: Portal 未返回 bindmac（原失败: %s）"
+                           % (info or ("resultCode=%s" % rc)))
+        print("[giwifi-auth] 检测到绑定/换绑提示（resultCode=%s reasoncode=%s bindmac=%s），调用 reBindMac 换绑"
+              % (rc, d.get("reasoncode"), bindmac), flush=True)
+        dec_rb = _post(REBIND_URL, user_mac=bindmac)
+        rb_ok = (dec_rb.get("status") == 1) or (dec_rb.get("data") == 1)
+        if rb_ok:
+            print("[giwifi-auth] reBindMac 成功，冷却 6 秒后重新认证", flush=True)
+            time.sleep(6)
+            dec2 = _post(AUTH_URL)
+            ok2, rc2, info2, _ = _result(dec2)
+            if ok2:
+                return True, (info2 or "登录成功") + "（已换绑并重新认证）"
+            return False, "换绑成功但重新认证失败: %s" % (info2 or ("resultCode=%s" % rc2))
+        rb_info = dec_rb.get("info") or ("reBindMac 失败 data=%s" % dec_rb.get("data"))
+        return False, "reBindMac 换绑失败: %s（原始失败: %s）" % (rb_info, info or ("resultCode=%s" % rc))
+    rc_meaning = _RC_MEANINGS.get(rc_code)
+    if rc_meaning:
+        return False, "%s（reasoncode=%s：%s）" % (info or ("登录失败 resultCode=%s" % rc),
+                                                rc_code, rc_meaning)
+    return False, info or ("登录失败 resultCode=%s" % rc)
+
+
+_BIND_HINTS = (
+    "绑定", "换绑", "设备数", "终端", "超限", "已满",
+    "在线数", "rebind", "bind", "force", "replace", "kick")
+# 封禁/停用/风控类提示：不属于换绑场景，出现时不得触发自动换绑
+_BAN_HINTS = ("封禁", "冻结", "停用", "禁用", "违规", "拉黑", "黑名单",
+              "投诉", "异常使用", "限制使用", "风控", "热点", "15分钟")
+
+# Portal reasoncode 含义（登录失败时附到提示里帮助排查）
+_RC_MEANINGS = {
+    1: "认证拒绝（账号或密码错误）",
+    27: "密码错误，需要重新登录",
+    32: "该账号还未设置密码",
+    40: "需要先完善个人信息",
+    41: "需要先绑定手机号",
+    43: "需要重新绑定设备 MAC",
+    55: "热点/共享行为风控，需等待后重试",
+}
+# 明确不是「设备 MAC 换绑」场景的 reasoncode，出现时绝不触发 reBindMac。
+# 注意 41 的文案含「绑定」二字（绑定手机号），必须显式排除，
+# 否则 _looks_like_bind_hint 会误判为设备换绑而错误调用 reBindMac。
+_NO_REBIND_RC = (1, 27, 32, 40, 41, 55)
+
+
+def _looks_like_bind_hint(text):
+    """识别 Portal 返回的绑定/换绑/设备数超限类提示（用于自动换绑触发）。
+    封禁/停用类提示优先排除，避免把账号封禁误判为换绑场景。"""
+    t = (text or "").lower()
+    if any(k in t for k in _BAN_HINTS):
+        return False
+    return any(k in t for k in _BIND_HINTS)
+
+
+def _probe_connectivity(iface=None, timeout=4):
+    """真实链路探测：依次尝试 Portal 主机（按 base_url 的实际端口）与
+    公共 DNS（223.5.5.5:80）的 TCP 可达性。任一可达即认为链路通；
+    全部失败返回 False（视为掉线）。
+    iface 非空时通过 SO_BINDTODEVICE 绑定指定接口发包，并绑定其源 IPv4
+    （mwan3 多 WAN 下保证探测也走对出口；仅 Linux）。"""
+    pu = urllib.parse.urlparse(BASE_URL)
+    portal_host = pu.hostname or BASE_URL
+    portal_port = pu.port or (443 if pu.scheme == "https" else 80)
+    so_bindtodevice = getattr(socket, "SO_BINDTODEVICE", None)
+    src_ip = _iface_ipv4(iface) if iface else ""
+    for host, port in ((portal_host, portal_port), ("223.5.5.5", 80)):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            if iface and so_bindtodevice is not None:
+                sock.setsockopt(socket.SOL_SOCKET,
+                                so_bindtodevice, iface.encode())
+            if src_ip:
+                sock.bind((src_ip, 0))
+            sock.connect((host, port))
+            return True
+        except OSError:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+    return False
+
+
+def query_online_state(account, sess=None):
+    """查询指定账号的认证状态。返回 (online, online_time)：
+    online=True 表示在线；online_time 为 Portal 提供的在线秒数（拿不到时为 None）。"""
+    if not _probe_connectivity(account.interface):
+        return False, None
+    if sess is not None:
+        sign, user_ip = sess.ensure_fresh()
+        sid = sess.sid
+    else:
+        sid, page_html = _fetch_login_page(account.ua, account.interface)
+        fields = _parse_login_page(page_html)
+        sign = fields.get("sign", "")
+        user_ip = fields.get("userIp", "")
+    login_url = urllib.parse.urljoin(BASE_URL, LOGIN_PATH)
+    qas = urllib.parse.urljoin(BASE_URL, "/gportal/web/queryAuthState")
+    body = urllib.parse.urlencode({"userIp": user_ip, "sign": sign})
+    status, _, raw = http_request(
+        qas, "POST", headers=_login_headers(login_url, sid, account.ua),
+        body=body, timeout=10, iface=account.interface)
+    if not (200 <= status < 300):
+        raise RuntimeError("queryAuthState HTTP %d" % status)
+    try:
+        dec = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        raise RuntimeError("queryAuthState 返回非 JSON")
+    if dec.get("status") != 1:
+        return False, None
+    ot = None
+    try:
+        inner = dec.get("data")
+        if isinstance(inner, dict) and isinstance(inner.get("data"), dict):
+            ot = inner["data"].get("onlineTime")
+    except (AttributeError, TypeError):
+        ot = None
+    if isinstance(ot, (int, float)) and ot >= 0:
+        return True, int(ot)
+    return True, None
+
+
+def check_online(account, sess=None):
+    """在线判定：链路探测 + queryAuthState。返回 True/False。"""
+    online, _ = query_online_state(account, sess)
+    return online
+
+
+def _fmt_duration(seconds):
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
+def _beijing_now():
+    """返回北京时间（UTC+8）时间戳字符串，格式 YYYY-MM-DD HH:MM:SS。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S",
+                         time.gmtime(time.time() + _BEIJING_OFFSET_SECONDS))
+
+
+def _log(ok, info, action=""):
+    """追加一条认证日志（滚动保留最近 LOG_KEEP 条）。
+
+    行格式: [时间] 成功/失败 [动作] 详情
+    追加用 O_APPEND 单行原子写；超过 LOG_TRIM 条时先写临时文件再
+    os.replace 原子替换，避免并发读写（守护 + 手动命令）损坏日志。
+    """
+    try:
+        tag = "成功" if ok else "失败"
+        act = "[%s] " % action if action else ""
+        line = "[%s] %s %s%s" % (_beijing_now(), tag,
+                                 act, (info or "").strip())
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        tmp = None
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+            if len(lines) > LOG_TRIM:
+                import tempfile
+                fd, tmp = tempfile.mkstemp(
+                    dir=os.path.dirname(LOG_PATH) or "/tmp", suffix=".log")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines[-LOG_KEEP:]) + "\n")
+                os.replace(tmp, LOG_PATH)
+        except OSError:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def cmd_log():
+    """显示最近 LOG_KEEP 条认证日志（最新在最上）。"""
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    if not lines:
+        print("暂无认证日志", flush=True)
+        return 1
+    for line in reversed(lines[-LOG_KEEP:]):
+        print(line, flush=True)
+    return 0
+
+
+# 网络/协议类异常：编程错误（bug）不在此列，避免被当作掉线误处理
+_NET_ERRORS = (OSError, http.client.HTTPException, RuntimeError)
+
+
+def _next_backoff(cur):
+    """指数退避：30 → 60 → 120 → 240 → 300（封顶），避免触发 Portal 风控。"""
+    return min(300, cur * 2 if cur else 30)
+
+
+def _jitter_interval():
+    """正常轮询间隔加随机抖动：基础间隔 + 0~20%（至少 1 秒），
+    避免多终端同时轮询对 Portal 造成时间同步冲击。"""
+    return random.randint(0, max(1, INTERVAL // 5))
+
+
+def cmd_logout(account):
+    """注销指定账号下线。返回 0=已下线, 1=注销失败, 2=异常。"""
+    try:
+        sid, page_html = _fetch_login_page(account.ua, account.interface)
+        fields = _parse_login_page(page_html)
+        logout_url = urllib.parse.urljoin(BASE_URL, "/gportal/web/authLogout")
+        body = urllib.parse.urlencode({
+            "nasName": fields.get("nasName", ""),
+            "nasIp": fields.get("nasIp", ""),
+            "userIp": fields.get("userIp", ""),
+            "userMac": fields.get("userMac", ""),
+            "ssid": fields.get("ssid", ""),
+            "apMac": fields.get("apMac", ""),
+            "pid": fields.get("pid", ""),
+            "vlan": fields.get("vlan", ""),
+            "sign": fields.get("sign", ""),
+            "iv": fields.get("iv", ""),
+            "redirectUrl": fields.get("redirectUrl", ""),
+            "portalTemplateId": fields.get("portalTemplateId", ""),
+        })
+        login_url = urllib.parse.urljoin(BASE_URL, LOGIN_PATH)
+        status, _, raw = http_request(
+            logout_url, "POST", headers=_login_headers(login_url, sid, account.ua),
+            body=body, timeout=10, iface=account.interface)
+        if not (200 <= status < 300):
+            raise RuntimeError("注销请求失败 HTTP %d" % status)
+        try:
+            dec = json.loads(raw.decode("utf-8", "replace"))
+        except (ValueError, TypeError):
+            raise RuntimeError("注销返回非 JSON: %s" % raw[:200])
+        if dec.get("status") == 1:
+            print("[%s] 已下线" % account.name, flush=True)
+            _log(True, "已下线", "logout")
+            return 0
+        msg = dec.get("info") or ("status=%s" % dec.get("status"))
+        print("[%s] 注销失败: %s" % (account.name, msg), flush=True)
+        _log(False, "注销失败: %s" % msg, "logout")
+        return 1
+    except _NET_ERRORS as e:
+        print("[%s] 注销异常: %s" % (account.name, e), flush=True)
+        _log(False, "注销异常: %s" % e, "logout")
+        return 2
+
+
+def _try_login(account):
+    """执行一次 do_login，网络/协议异常统一转成 (False, "异常")。"""
+    try:
+        return do_login(account)
+    except _NET_ERRORS as e:
+        print("[%s] 登录异常: %s" % (account.name, e), flush=True)
+        return False, "异常"
+
+
+def _login_with_retry(account):
+    """执行认证；Portal 限流时等待 6 秒重试一次。返回 (ok, info)。"""
+    ok, info = _try_login(account)
+    if ok:
+        return True, info
+    if "频繁" in info or "5秒后再试" in info:
+        print("[%s] 操作过于频繁，等待 6 秒后重试认证" % account.name, flush=True)
+        time.sleep(6)
+        ok, info = _try_login(account)
+    return ok, info
+
+
+def _uci_section_username(sid):
+    """用 uci CLI 按段名反查该段配置的 username，查不到返回空串。
+
+    LuCI「添加账号」新建的是匿名段：libuci 会在内存中给它分配 cfgXXXXXX 形式的
+    内部名（该名字不会写进配置文件），而前端拿到的正是这个名字。插件按文件解析
+    只能把它视作 `@account[序号]`，无法与 cfgXXXXXX 对应，故借助 uci CLI 反查。"""
+    if not re.match(r"^[A-Za-z0-9_]+$", sid or ""):
+        return ""
+    try:
+        p = subprocess.run(["uci", "get", "%s.%s.username" % (_UCI_CONF, sid)],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def _accounts_matching(accounts, target):
+    """按 UCI 段名 / 绑定接口 / 用户名匹配账号。
+
+    绑定接口在同一份配置中唯一（见 check-config），因此可以作为前端传参的稳定标识：
+    LuCI「添加账号」生成的是匿名段，前端手里的 cfgXXXXXX / newXXXXXX 落盘后并不存在，
+    而用户名可能被多个接口复用，接口才是既唯一又稳定的选择。匹配按
+    段名 → 接口 → 用户名 的优先级进行，避免同名时一次匹配到多个账号。"""
+    for attr in ("name", "interface", "username"):
+        matched = [a for a in accounts if getattr(a, attr) == target]
+        if matched:
+            return matched
+    return []
+
+
+def _resolve_accounts(accounts, target):
+    """先按段名/用户名/接口匹配，匹配不到再用 uci CLI 反查匿名段用户名。"""
+    matched = _accounts_matching(accounts, target)
+    if matched:
+        return matched
+    resolved = _uci_section_username(target)
+    if resolved:
+        return [a for a in accounts if a.username == resolved]
+    return []
+
+
+def cmd_login(name=None):
+    """立即登录。name 为空时登录所有启用的账号，否则只登录该账号。"""
+    _refresh_cfg()
+    all_accounts = _load_accounts()
+    if name:
+        accounts = _resolve_accounts(all_accounts, name)
+        if not accounts:
+            print("错误: 账号 %s 不存在或未启用" % name, flush=True)
+            return 3
+    elif not all_accounts:
+        print("错误: 没有已启用且配置完整的账号", flush=True)
+        return 3
+    else:
+        accounts = all_accounts
+    overall_ok = True
+    for acc in accounts:
+        ready, why = _iface_ready(acc.interface)
+        if not ready:
+            print("[%s] 警告: %s" % (acc.name, why), flush=True)
+        try:
+            online = check_online(acc)
+        except _NET_ERRORS as e:
+            online = None
+            print("[%s] 在线状态检查异常: %s（继续尝试登录）" % (acc.name, e), flush=True)
+        if online:
+            print("[%s] 当前已在线，先注销下线..." % acc.name, flush=True)
+            rc = cmd_logout(acc)
+            print("[%s] 冷却 6 秒后重新认证" % acc.name, flush=True)
+            time.sleep(6)
+        ok, info = _login_with_retry(acc)
+        _log(ok, info, "login")
+        if ok:
+            print("[%s] 登录成功: %s" % (acc.name, info), flush=True)
+        else:
+            print("[%s] 登录失败: %s" % (acc.name, info), flush=True)
+            overall_ok = False
+            if "403" in info or "Forbidden" in info:
+                print("[%s] 提示: Portal 拒绝了当前 User-Agent。" % acc.name, flush=True)
+    return 0 if overall_ok else 1
+
+
+def _account_label(acc):
+    """状态输出用用户名（附绑定接口），不再显示匿名 UCI 段名。"""
+    label = acc.username or acc.name
+    if acc.interface:
+        label = "%s (%s)" % (label, acc.interface)
+    return label
+
+
+def cmd_status():
+    """查询并显示所有账号的在线状态与在线时长。"""
+    _refresh_cfg()
+    accounts = _load_accounts()
+    if not accounts:
+        print("无已启用账号", flush=True)
+        return 1
+    all_online = True
+    for acc in accounts:
+        label = _account_label(acc)
+        try:
+            online, ot = query_online_state(acc)
+        except _NET_ERRORS as e:
+            if _probe_connectivity(acc.interface):
+                print("[%s] 在线（Portal 会话查询受限，链路正常）" % label, flush=True)
+                continue
+            print("[%s] 状态查询异常: %s" % (label, e), flush=True)
+            all_online = False
+            continue
+        if online:
+            if ot is not None:
+                print("[%s] 在线，当前在线时长 %s" % (label, _fmt_duration(ot)), flush=True)
+            else:
+                print("[%s] 在线" % label, flush=True)
+        else:
+            print("[%s] 掉线" % label, flush=True)
+            all_online = False
+    return 0 if all_online else 1
+
+
+def cmd_check():
+    """检查所有账号在线状态。全部在线返回 0，任一掉线返回 1，异常返回 2。"""
+    _refresh_cfg()
+    accounts = _load_accounts()
+    if not accounts:
+        return 1
+    all_online = True
+    has_error = False
+    for acc in accounts:
+        label = _account_label(acc)
+        try:
+            online = check_online(acc)
+        except _NET_ERRORS as e:
+            print("[%s] 检查异常: %s" % (label, e), flush=True)
+            has_error = True
+            continue
+        print("[%s] %s" % (label, "在线" if online else "掉线"), flush=True)
+        if not online:
+            all_online = False
+    if has_error:
+        return 2
+    return 0 if all_online else 1
+
+
+def _long_backoff_seconds(info):
+    """Portal 限时/风控类失败应长退避，避免无意义重试烧请求：
+    - 热点/共享行为（reasoncode=55）：Portal 明确要求等 15 分钟 -> 900s
+    - 当日时长用尽（如"今天时长已用完"）：日级限制，短重试无用 -> 1800s
+    返回 0 表示不适用。"""
+    if "热点" in info or "共享" in info or "15分钟" in info:
+        return 900
+    if "时长已用完" in info or "时长用完" in info:
+        return 1800
+    return 0
+
+
+def _mask_account(name):
+    """日志脱敏：账号只保留前 3 位，避免明文出现在 procd/系统日志。"""
+    name = name or ""
+    if len(name) <= 3:
+        return "*" * len(name)
+    return name[:3] + "*" * (len(name) - 3)
+
+
+def _parse_hhmm(value):
+    """解析界面选择的 HH:MM 时间；非法值返回 None。"""
+    try:
+        hh, mm = str(value).strip().split(":", 1)
+        hh, mm = int(hh), int(mm)
+    except (ValueError, TypeError):
+        return None
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh, mm
+    return None
+
+
+def _parse_cron_field(field, min_val, max_val):
+    """解析 cron 单字段，返回匹配值集合。支持 * /n a-b a,b,c。"""
+    result = set()
+    for part in field.split(","):
+        step = 1
+        if "/" in part:
+            part, step_s = part.split("/", 1)
+            step = int(step_s)
+        if part == "*":
+            start, end = min_val, max_val
+        elif "-" in part:
+            s, e = part.split("-", 1)
+            start, end = int(s), int(e)
+        else:
+            start = end = int(part)
+        for v in range(start, end + 1, step):
+            if min_val <= v <= max_val:
+                result.add(v)
+    return result
+
+
+def _cron_matches(expr, t):
+    """判断时间 t（time.struct_time）是否匹配 5 段 cron 表达式。"""
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return False
+    minute, hour, dom, month, dow = parts
+    return (t.tm_min in _parse_cron_field(minute, 0, 59)
+            and t.tm_hour in _parse_cron_field(hour, 0, 23)
+            and t.tm_mday in _parse_cron_field(dom, 1, 31)
+            and t.tm_mon in _parse_cron_field(month, 1, 12)
+            and (t.tm_wday + 1) % 7 in _parse_cron_field(dow, 0, 6))
+
+
+def _iface_restart_loop():
+    """定时重启接口线程：按界面选择的 HH:MM 每天重启一次。
+
+    旧配置没有 iface_restart_time 时，回退到 iface_restart_cron。
+    """
+    last_trigger = None
+    while True:
+        _load_global_cfg()
+        if IFACE_RESTART_ENABLED:
+            now = time.localtime()
+            # 用 (year, yday, hour, min) 去重，确保同一分钟只触发一次
+            trigger_key = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min)
+            restart_at = _parse_hhmm(IFACE_RESTART_TIME)
+            if restart_at is not None:
+                due = (now.tm_hour, now.tm_min) == restart_at
+            else:
+                try:
+                    due = _cron_matches(IFACE_RESTART_CRON, now)
+                except (ValueError, TypeError):
+                    # 旧配置的 cron 非法：跳过本次并继续轮询，不能让线程崩掉
+                    due = False
+            if trigger_key != last_trigger and due:
+                last_trigger = trigger_key
+                accounts = _load_accounts()
+                ifaces = []
+                for acc in accounts:
+                    if acc.interface and acc.interface not in ifaces:
+                        ifaces.append(acc.interface)
+                for iface in ifaces:
+                    if not _valid_iface_name(iface):
+                        continue
+                    print("[giwifi-auth] 定时重启接口 %s" % iface, flush=True)
+                    try:
+                        subprocess.run(["ip", "link", "set", iface, "down"],
+                                       capture_output=True, timeout=10)
+                        time.sleep(2)
+                        subprocess.run(["ip", "link", "set", iface, "up"],
+                                       capture_output=True, timeout=10)
+                        print("[giwifi-auth] 接口 %s 已重启" % iface, flush=True)
+                    except Exception as e:
+                        print("[giwifi-auth] 接口 %s 重启失败: %s" % (iface, e), flush=True)
+        time.sleep(30)
+
+
+def _run_account(account):
+    """单账号守护循环：在独立线程中运行，轮询该账号接口的在线状态并认证。"""
+    print("[giwifi-auth] 启动账号监控: %s 接口=%s 间隔=%ds 账号=%s"
+          % (account.name, account.interface, INTERVAL,
+             _mask_account(account.username)), flush=True)
+    sess = _Session(account.ua, account.interface)
+    backoff = 0
+    while True:
+        _refresh_cfg(stop_if_disabled=True)
+        start = time.monotonic()
+        ready, why = _iface_ready(account.interface)
+        if not ready:
+            print("[%s] %s，%d 秒后重试" % (account.name, why, INTERVAL), flush=True)
+            time.sleep(INTERVAL)
+            continue
+        try:
+            online = check_online(account, sess)
+        except _NET_ERRORS as e:
+            print("[%s] 检查异常: %s" % (account.name, e), flush=True)
+            online = None
+        delay = INTERVAL + _jitter_interval()
+        if online is False:
+            print("[%s] 掉线，尝试登录" % account.name, flush=True)
+            try:
+                ok, info = do_login(account, sess)
+                print("[%s] %s: %s"
+                      % (account.name, "登录成功" if ok else "登录失败", info), flush=True)
+                _log(ok, info, "auto")
+                if ok:
+                    backoff = 0
+                else:
+                    lb = _long_backoff_seconds(info)
+                    if lb:
+                        backoff = lb
+                        delay = lb
+                        print("[%s] Portal 限制，等待 %d 分钟后重试"
+                              % (account.name, lb // 60), flush=True)
+                    else:
+                        backoff = _next_backoff(backoff)
+                        delay = backoff
+            except _NET_ERRORS as e:
+                print("[%s] 登录异常: %s" % (account.name, e), flush=True)
+                backoff = _next_backoff(backoff)
+                delay = backoff
+        elif online is True:
+            backoff = 0
+        else:
+            backoff = _next_backoff(backoff)
+            delay = backoff
+            print("[%s] 检查失败（网络异常），稍后重试" % account.name, flush=True)
+        elapsed = time.monotonic() - start
+        time.sleep(max(1, delay - elapsed))
+
+
+def cmd_run():
+    """多账号守护：为每个启用账号启动独立线程，另起定时重启接口线程。"""
+    _refresh_cfg(stop_if_disabled=True)
+    accounts = _load_accounts()
+    if not accounts:
+        print("[giwifi-auth] 无已启用账号，退出", flush=True)
+        return
+    print("[giwifi-auth] 启动 %d 个账号监控线程 + 定时接口重启线程"
+          % len(accounts), flush=True)
+    threads = []
+    for acc in accounts:
+        t = threading.Thread(target=_run_account, args=(acc,),
+                             name="giwifi-%s" % acc.name, daemon=True)
+        t.start()
+        threads.append(t)
+    rt = threading.Thread(target=_iface_restart_loop, name="giwifi-iface-restart",
+                          daemon=True)
+    rt.start()
+    threads.append(rt)
+    # 主线程等待所有子线程（守护线程随主线程退出）
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("[giwifi-auth] 收到中断信号，退出", flush=True)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "login":
+        sys.exit(cmd_login(sys.argv[2] if len(sys.argv) > 2 else None))
+    elif cmd == "logout":
+        _refresh_cfg()
+        all_accounts = _load_accounts()
+        name = sys.argv[2] if len(sys.argv) > 2 else None
+        if name:
+            accounts = _resolve_accounts(all_accounts, name)
+            if not accounts:
+                print("未找到账号: %s" % name, flush=True)
+                sys.exit(1)
+        else:
+            accounts = all_accounts
+        rc = 0
+        for acc in accounts:
+            r = cmd_logout(acc)
+            if r != 0:
+                rc = r
+        sys.exit(rc)
+    elif cmd == "check":
+        sys.exit(cmd_check())
+    elif cmd == "log":
+        sys.exit(cmd_log())
+    elif cmd == "status":
+        sys.exit(cmd_status())
+    elif cmd == "sync-ua3f":
+        # 保存配置时调用：把全局 ua3f_sync_ua 同步给 UA3F（未安装/无值则跳过）
+        _refresh_cfg()
+        _sync_ua3f()
+    elif cmd == "check-config":
+        # 保存后校验：接口唯一性（0=通过, 1=存在重复绑定）
+        sys.exit(cmd_check_config())
+    elif cmd == "run":
+        try:
+            cmd_run()
+        except KeyboardInterrupt:
+            pass
+    else:
+        print("用法: giwifi-auth {login [name]|logout [name]|status|log|check|sync-ua3f|check-config|run}", flush=True)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

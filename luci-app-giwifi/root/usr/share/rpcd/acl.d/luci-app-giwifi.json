@@ -1,0 +1,24 @@
+{
+	"luci-app-giwifi": {
+		"description": "Grant access to the GiWiFi authentication configuration",
+		"read": {
+			"file": {
+				"/sys/class/net": [ "list" ]
+			},
+			"ubus": {
+				"file": [ "list" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "giwifi-auth", "network", "firewall" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/giwifi-auth": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"uci": [ "giwifi-auth" ]
+		}
+	}
+}

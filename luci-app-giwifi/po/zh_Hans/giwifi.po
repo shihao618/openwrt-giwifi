@@ -1,0 +1,163 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-giwifi\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-10-18 00:00+0800\n"
+"PO-Revision-Date: 2026-10-18 00:00+0800\n"
+"Last-Translator: xGiWifi\n"
+"Language-Team: \n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Detecting…"
+msgstr "正在检测…"
+
+msgid "Failed to retrieve status. Check the network and try again."
+msgstr "获取在线状态失败，请检查网络或稍后重试。"
+
+msgid "No enabled accounts"
+msgstr "无已启用账号"
+
+msgid "Refresh"
+msgstr "刷新"
+
+msgid "No authentication log entries"
+msgstr "暂无认证日志"
+
+msgid "GiWiFi Authentication"
+msgstr "GiWiFi 认证"
+
+msgid "Automatically log in to the GiWiFi campus portal. Supports multiple accounts and interfaces, and re-authenticates when the session drops."
+msgstr "自动登录 GiWiFi 校园网 Portal，支持多账号、多接口，掉线自动重登。"
+
+msgid "Status"
+msgstr "运行状态"
+
+msgid "Account status"
+msgstr "账号状态"
+
+msgid "Auto rebind"
+msgstr "自动换绑"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "General Settings"
+msgstr "全局配置"
+
+msgid "Log"
+msgstr "日志"
+
+msgid "Version"
+msgstr "插件版本"
+
+msgid "Daemon"
+msgstr "守护进程"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Global Switch"
+msgstr "全局开关"
+
+msgid "Enabled"
+msgstr "已启用"
+
+msgid "Disabled"
+msgstr "已禁用"
+
+msgid "Account Status"
+msgstr "账号在线状态"
+
+msgid "Recent Authentication Log"
+msgstr "最近认证日志"
+
+msgid "Enable daemon"
+msgstr "启用守护进程"
+
+msgid "Portal base URL"
+msgstr "Portal 基地址"
+
+msgid "Invalid URL"
+msgstr "无效的 URL"
+
+msgid "Poll interval (seconds)"
+msgstr "轮询间隔（秒）"
+
+msgid "Restart interface on schedule"
+msgstr "定时重启接口"
+
+msgid "Restart time"
+msgstr "重启时间"
+
+msgid "Local time on the router"
+msgstr "使用路由器本地时间"
+
+msgid "UA3F terminal type synchronization"
+msgstr "同步给 UA3F 的终端类型"
+
+msgid "Do not synchronize (leave UA3F unchanged)"
+msgstr "不同步（不修改 UA3F）"
+
+msgid "Accounts"
+msgstr "账号列表"
+
+msgid "Add Account"
+msgstr "添加账号"
+
+msgid "Edit Account"
+msgstr "编辑账号"
+
+msgid "Edit"
+msgstr "编辑"
+
+msgid "Interface"
+msgstr "绑定接口"
+
+msgid "Username"
+msgstr "账号"
+
+msgid "Device type"
+msgstr "终端类型"
+
+msgid "Interface \"%s\" is already bound to account \"%s\". Please remove the duplicate binding first."
+msgstr "该接口 \"%s\" 已被账号 \"%s\" 绑定，请先解除重复绑定。"
+
+msgid "Password"
+msgstr "密码"
+
+msgid "Custom User-Agent (optional)"
+msgstr "自定义 UA（可选）"
+
+msgid "Automatically rebind MAC"
+msgstr "自动换绑 MAC"
+
+msgid "Log in"
+msgstr "登录"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "(no output)"
+msgstr "（无输出）"
+
+msgid "Login result"
+msgstr "登录结果"
+
+msgid "Close"
+msgstr "关闭"
+
+msgid "Interface \"%s\" is bound to multiple accounts. Please remove the duplicate binding first."
+msgstr "接口 \"%s\" 被多个账号同时绑定，请先解除重复绑定。"
+
+msgid "Failed to save: %s"
+msgstr "保存失败：%s"
