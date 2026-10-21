@@ -11,7 +11,13 @@ set -eu
 
 REPO="${GIWIFI_REPO:-shihao618/openwrt-giwifi}"
 REF="${GIWIFI_REF:-main}"
-BASE="${GIWIFI_BASE:-https://raw.githubusercontent.com/$REPO/$REF/artifacts}"
+DEFAULT_BASE="https://raw.githubusercontent.com/$REPO/$REF/artifacts"
+MIRROR_BASES="https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/artifacts https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/artifacts"
+if [ -n "${GIWIFI_BASE:-}" ]; then
+    BASES="$GIWIFI_BASE"
+else
+    BASES="$DEFAULT_BASE $MIRROR_BASES"
+fi
 
 PACKAGES="
 giwifi-auth-2.1.2-r1.apk
@@ -35,11 +41,11 @@ command -v apk >/dev/null 2>&1 || fail "当前固件没有 apk，请使用 OpenW
 
 fetch() {
     if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1" || fail "下载失败: $1"
+        wget -q -O "$2" "$1" || return 1
     elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2" || fail "下载失败: $1"
+        curl -fsSL "$1" -o "$2" || return 1
     else
-        fail "缺少 wget/curl，无法从 GitHub 下载。"
+        return 1
     fi
 }
 
@@ -48,7 +54,15 @@ mkdir -p "$TMP"
 echo "== 从 GitHub 下载 GiWiFi 安装包 ($REF) =="
 for pkg in $PACKAGES; do
     echo "  -> $pkg"
-    fetch "$BASE/$pkg" "$TMP/$pkg"
+    ok=0
+    for base in $BASES; do
+        if fetch "$base/$pkg" "$TMP/$pkg"; then
+            ok=1
+            break
+        fi
+        echo "     下载失败，尝试下一个镜像..."
+    done
+    [ "$ok" = "1" ] || fail "所有下载源均失败: $pkg"
 done
 
 echo "== 安装 =="

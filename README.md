@@ -89,6 +89,22 @@ wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/ins
 curl -fsSL https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | sh
 ```
 
+如果出现：
+
+```text
+SSL error: error:00000005:lib(0)::reason(5)
+```
+
+通常是当前网络阻断了 `raw.githubusercontent.com`（不是证书或插件问题），
+可改用 GitHub 镜像：
+
+```sh
+wget -qO- 'https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh' \
+  | GIWIFI_BASE='https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/artifacts' sh
+```
+
+`install-online.sh` 里也内置了 `ghproxy.net` / `gh-proxy.com` 的安装包下载回退。
+
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
