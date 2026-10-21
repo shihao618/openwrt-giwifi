@@ -41,6 +41,8 @@ cleanup_all() {
             fi
         done < "$STATE_FILE"
     fi
+    # UA3F's transparent-proxy output mark bypasses the per-WAN source rules.
+    ip rule del fwmark 0xc9 lookup main priority 500 2>/dev/null || true
     cleanup_ecmp
     rm -rf "$STATE_DIR"
 }
@@ -126,6 +128,12 @@ apply_all() {
     if [ -w /proc/sys/net/ipv4/fib_multipath_hash_policy ]; then
         echo 1 > /proc/sys/net/ipv4/fib_multipath_hash_policy 2>/dev/null || true
     fi
+
+    # UA3F is a transparent TPROXY helper.  Its outbound sockets carry
+    # fwmark 0xc9; without this higher-priority rule they match the
+    # per-WAN "from <WAN IP>" rules below and every proxied LAN connection
+    # exits a single WAN, regardless of the ECMP route.
+    ip rule add fwmark 0xc9 lookup main priority 500 2>/dev/null || true
 
     # Native ECMP and mwan3 policy routing cannot safely coexist.
     if pgrep -f '[m]wan3' >/dev/null 2>&1; then
