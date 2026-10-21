@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=giwifi-auth
-PKG_VERSION:=2.1.0
+PKG_VERSION:=2.1.1
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=yangxingyu <1767274678@qq.com>
@@ -18,7 +18,7 @@ define Package/giwifi-auth
   SECTION:=net
   CATEGORY:=Network
   TITLE:=GiWiFi campus auto-login (Web authLogin)
-  DEPENDS:=+python3-light +python3-urllib +python3-openssl
+  DEPENDS:=+python3-light +python3-urllib +python3-openssl +ip-full
   PKGARCH:=all
 endef
 
@@ -74,6 +74,8 @@ define Package/giwifi-auth/install
 	$(INSTALL_BIN) ./files/etc/init.d/giwifi-auth $(1)/etc/init.d/giwifi-auth
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/90-giwifi-policy $(1)/etc/hotplug.d/iface/90-giwifi-policy
+	$(INSTALL_DIR) $(1)/etc/sysctl.d
+	$(INSTALL_DATA) ./files/etc/sysctl.d/99-giwifi-ecmp.conf $(1)/etc/sysctl.d/99-giwifi-ecmp.conf
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) ./files/etc/config/giwifi-auth $(1)/etc/config/giwifi-auth
 endef

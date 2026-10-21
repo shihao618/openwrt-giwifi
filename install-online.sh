@@ -5,7 +5,7 @@
 #   wget -qO- https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | sh
 #
 # Optional overrides:
-#   GIWIFI_REF=v2.1.0   Git branch/tag whose artifacts/ directory is used
+#   GIWIFI_REF=v2.1.1   Git branch/tag whose artifacts/ directory is used
 #   GIWIFI_BASE=...     Mirror prefix that contains the three apk files
 set -eu
 
@@ -14,8 +14,8 @@ REF="${GIWIFI_REF:-main}"
 BASE="${GIWIFI_BASE:-https://raw.githubusercontent.com/$REPO/$REF/artifacts}"
 
 PACKAGES="
-giwifi-auth-2.1.0-r1.apk
-luci-app-giwifi-2.1.0-r1.apk
+giwifi-auth-2.1.1-r1.apk
+luci-app-giwifi-2.1.1-r1.apk
 luci-i18n-giwifi-zh-cn-0.261021.47922.apk
 "
 

@@ -121,6 +121,12 @@ apply_all() {
 
     mkdir -p "$STATE_DIR" || exit 1
 
+    # Include L4 ports in the multipath hash.  With the default L3-only
+    # hash, concurrent connections to the same server all stick to one WAN.
+    if [ -w /proc/sys/net/ipv4/fib_multipath_hash_policy ]; then
+        echo 1 > /proc/sys/net/ipv4/fib_multipath_hash_policy 2>/dev/null || true
+    fi
+
     # Native ECMP and mwan3 policy routing cannot safely coexist.
     if pgrep -f '[m]wan3' >/dev/null 2>&1; then
         log 'mwan3 is running; native ECMP is disabled until mwan3 is stopped'

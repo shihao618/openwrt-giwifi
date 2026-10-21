@@ -82,6 +82,12 @@ do_check() {
         say "  [WARN] giwifi-auth 未安装"
     fi
 
+    if ip -V 2>/dev/null | grep -q 'iproute2'; then
+        say "  [OK] ip-full 已安装（ECMP multipath 可用）"
+    else
+        say "  [WARN] 当前 ip 是 BusyBox，ECMP 不可用，需安装 ip-full"
+    fi
+
     if [ -x /usr/sbin/giwifi-policy ] \
        && [ -x /etc/hotplug.d/iface/90-giwifi-policy ]; then
         say "  [OK] giwifi 路由策略/ECMP 组件已安装"
@@ -163,7 +169,7 @@ do_install() {
     [ -f "$UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js" ] \
         || die "找不到 $UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js。请把 install.sh 与 luci-app-giwifi/ 目录放在一起后重试。"
 
-    say "[1/7] 安装依赖 python3-light python3-urllib python3-openssl ..."
+    say "[1/7] 安装依赖 python3-light python3-urllib python3-openssl ip-full ..."
     # 25.12/snapshot 已切换到 apk；老版本仍用 opkg。
     if check_python; then
         say "       python3 及所需模块已存在，跳过"
@@ -175,6 +181,15 @@ do_install() {
         opkg install python3-light python3-urllib python3-openssl
     else
         warn "  [WARN] 未找到 apk/opkg，请手动安装 python3-light python3-urllib python3-openssl"
+    fi
+
+    if ! ip -V 2>/dev/null | grep -q 'iproute2'; then
+        say "       安装 ip-full（BusyBox ip 不支持 ECMP multipath）..."
+        if command -v apk >/dev/null 2>&1; then
+            apk add ip-full || warn "  [WARN] ip-full 安装失败，ECMP 将不可用"
+        elif command -v opkg >/dev/null 2>&1; then
+            opkg install ip-full || warn "  [WARN] ip-full 安装失败，ECMP 将不可用"
+        fi
     fi
 
     if [ ! -f /www/luci-static/resources/form.js ]; then

@@ -92,8 +92,8 @@ curl -fsSL https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/insta
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
-# 固定使用 v2.1.0 的 artifacts
-wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.0 sh
+# 固定使用 v2.1.1 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.1 sh
 
 # 自定义 artifact 镜像前缀
 wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
@@ -200,10 +200,16 @@ config account 'name'                   # 可多个（LuCI 添加的为匿名段
 LAN 侧的新连接会按 Linux ECMP 哈希分摊到各 WAN；单个 TCP 连接仍然只走一条
 WAN，因此这是**多连接/多线程总带宽叠加**，不是单连接带宽叠加。
 
+插件依赖 `ip-full`（BusyBox 的 `ip` 不支持 multipath），并把 IPv4 ECMP 哈希策略设为
+L4（`net.ipv4.fib_multipath_hash_policy=1`）。否则同一客户端到同一服务器的多个
+连接只按源/目的 IP 哈希，会全部落在同一条 WAN，表现为“多线程始终用 wan1”。
+
 注意事项：
 
 - **必须停用 mwan3**：mwan3 的 fwmark 策略路由与 fwmark 规则会和本方案冲突；
   `giwifi-policy` 检测到 mwan3 进程时会清理本插件生成的路由并跳过 ECMP 配置；
+- **必须安装 `ip-full`**：本包已声明依赖；若卸载了 mwan3，注意不要连带移除 `ip-full`，
+  否则 ECMP 路由无法创建，只能走 metric 最小的 wan1；
 - 接口 up/down、DHCP 续租、账号增删改、插件保存并应用时都会自动重建；
 - 账号接口必须已经取得 IPv4 地址和默认网关，否则该接口暂不参与 ECMP；
 - 权重默认均为 1；如需调整，可在账号 section 中加 `option weight '2'`（1~100）。
@@ -280,10 +286,10 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.1.0-r1.apk`
-- `artifacts/luci-app-giwifi-2.1.0-r1.apk`
+- `artifacts/giwifi-auth-2.1.1-r1.apk`
+- `artifacts/luci-app-giwifi-2.1.1-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
-- `artifacts/openwrt-giwifi-2.1.0.zip`
+- `artifacts/openwrt-giwifi-2.1.1.zip`
 
 ## 测试
 
