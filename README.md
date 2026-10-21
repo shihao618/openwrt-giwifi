@@ -17,8 +17,10 @@ openwrt-giwifi/
 │   └── files/
 │       ├── etc/
 │       │   ├── init.d/giwifi-auth          # procd 守护进程 + UCI 变更触发器
-│       │   └── config/giwifi-auth          # UCI 配置模板
-│       └── usr/bin/giwifi-auth             # 认证脚本（纯标准库 Python3）
+│       │   ├── config/giwifi-auth          # UCI 配置模板
+│       │   └── hotplug.d/iface/90-giwifi-policy  # 接口变化时重建策略路由
+│       ├── usr/bin/giwifi-auth             # 认证脚本（纯标准库 Python3）
+│       └── usr/sbin/giwifi-policy          # 每账号路由表 + 原生 ECMP 管理器
 ├── luci-app-giwifi/              # LuCI 界面包（官方 luci.mk / htdocs / root / po 结构）
 │   ├── Makefile                  # LUCI_TITLE / LUCI_DEPENDS + luci.mk
 │   ├── htdocs/luci-static/resources/view/network/giwifi.js
@@ -47,8 +49,10 @@ openwrt-giwifi/
 - 可选用 iPad / iPhone / Windows / Android UA，或自定义 UA；
 - 可选每天定时重启接口（界面直接选择时间）；
 - 可选把全局 UA 同步给 UA3F（`ua3f_sync_ua`）；
-- 多网口 / 单网口、装或不装 mwan3 均可用：认证请求同时绑定出接口与源 IP，
-  多 WAN 下不会因路由表默认 metric 偏斜而走错出口；绑定接口无地址时提前提示并退避；
+- 多网口自动负载均衡：启用多个账号并绑定不同 WAN 接口后，插件自动为每个账号建立
+  独立路由表 + 源地址规则，并用这些接口生成原生 ECMP 默认路由；无需手工写
+  `ip rule`/`ip route`，也不依赖 mwan3（ECMP 模式要求停用 mwan3）；
+  认证请求仍同时绑定出接口与源 IP，多 WAN 下不会走错出口；绑定接口无地址时提前提示并退避；
 - LuCI 页面：运行状态、账号在线状态、最近认证日志、账号增删改、手动登录。
 
 ## 依赖
@@ -157,6 +161,7 @@ config giwifi 'main'
 	option iface_restart_enabled '0'    # 定时重启接口
 	option iface_restart_time '04:00'   # 每天重启时间 HH:MM
 	option ua3f_sync_ua ''              # 同步给 UA3F 的终端类型，空=不改
+	option ecmp_enabled '1'             # 根据账号绑定接口自动做 ECMP 负载均衡
 
 # 以下两个空段仅用于 LuCI 的“运行状态 / 日志”选项卡，无配置项
 config status 'status'
@@ -177,18 +182,38 @@ config account 'name'                   # 可多个（LuCI 添加的为匿名段
 | `enabled` | 是否启用守护 | `0` |
 | `base_url` | Portal 基地址 | `http://10.189.1.3` |
 | `interval` | 轮询间隔秒（加 0~20% 随机抖动） | `30` |
+| `ecmp_enabled` | 根据账号绑定接口自动构建原生 ECMP 默认路由 | `1` |
 | `device_type` | `ipad`/`iphone`/`windows`/`android` | `windows` |
 | `device_ua` | 自定义 UA（非空时优先） | 空 |
 | `auto_rebind` | 绑定冲突自动换绑 | `0` |
 
 同一网络接口只能被一个账号绑定：页面保存时会校验，运行期守护也会跳过后来者。
 
+## 自动 ECMP 负载均衡
+
+插件会自动读取所有已启用账号的 `interface`，为每个接口生成：
+
+- 独立路由表：`table 100 + ifindex`；
+- 源地址规则：`from <接口 IPv4> lookup <table> priority 1000`；
+- 所有接口的 ECMP 默认路由：`nexthop via <网关> dev <接口> weight 1`。
+
+LAN 侧的新连接会按 Linux ECMP 哈希分摊到各 WAN；单个 TCP 连接仍然只走一条
+WAN，因此这是**多连接/多线程总带宽叠加**，不是单连接带宽叠加。
+
+注意事项：
+
+- **必须停用 mwan3**：mwan3 的 fwmark 策略路由与 fwmark 规则会和本方案冲突；
+  `giwifi-policy` 检测到 mwan3 进程时会清理本插件生成的路由并跳过 ECMP 配置；
+- 接口 up/down、DHCP 续租、账号增删改、插件保存并应用时都会自动重建；
+- 账号接口必须已经取得 IPv4 地址和默认网关，否则该接口暂不参与 ECMP；
+- 权重默认均为 1；如需调整，可在账号 section 中加 `option weight '2'`（1~100）。
+
 ## LuCI 界面
 
 安装后进入 **网络 → GiWiFi 认证**（`luci-app-giwifi` 包）：
 
 - **运行状态**：插件版本、守护状态、账号在线状态（显示用户名+接口）；
-- **设置**：启用、Portal 地址、轮询间隔、定时重启时间、UA3F 同步终端类型；
+- **设置**：启用、Portal 地址、轮询间隔、自动 ECMP 负载均衡、定时重启时间、UA3F 同步终端类型；
 - **账号列表**：左侧接口图标+用户名，中间显示终端类型、账号状态、自动换绑状态，右侧操作按钮；操作列提供 **登录 / 停止或启用 / 编辑 / 删除**；
 - **日志**：最近认证日志；
 - 「添加账号」弹窗内填写绑定接口、账号、密码、终端类型、自定义 UA、自动换绑；

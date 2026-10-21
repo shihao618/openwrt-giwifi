@@ -68,8 +68,12 @@ define Package/giwifi-auth/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/giwifi-auth $(1)/usr/bin/giwifi-auth
 	find $(1)/usr/bin -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) ./files/usr/sbin/giwifi-policy $(1)/usr/sbin/giwifi-policy
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/giwifi-auth $(1)/etc/init.d/giwifi-auth
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/90-giwifi-policy $(1)/etc/hotplug.d/iface/90-giwifi-policy
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) ./files/etc/config/giwifi-auth $(1)/etc/config/giwifi-auth
 endef

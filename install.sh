@@ -82,6 +82,13 @@ do_check() {
         say "  [WARN] giwifi-auth 未安装"
     fi
 
+    if [ -x /usr/sbin/giwifi-policy ] \
+       && [ -x /etc/hotplug.d/iface/90-giwifi-policy ]; then
+        say "  [OK] giwifi 路由策略/ECMP 组件已安装"
+    else
+        say "  [WARN] giwifi 路由策略/ECMP 组件不完整"
+    fi
+
     if [ -f /www/luci-static/resources/view/network/giwifi.js ] \
        && [ -f /www/luci-static/resources/icons/giwifi.svg ] \
        && [ -f /usr/share/luci/menu.d/luci-app-giwifi.json ] \
@@ -128,6 +135,7 @@ do_uninstall() {
     /etc/init.d/giwifi-auth disable 2>/dev/null || true
 
     rm -f /usr/bin/giwifi-auth /etc/init.d/giwifi-auth
+    rm -f /usr/sbin/giwifi-policy /etc/hotplug.d/iface/90-giwifi-policy
     rm -rf /usr/bin/__pycache__ 2>/dev/null || true
     rm -f /www/luci-static/resources/view/network/giwifi.js
     rm -f /www/luci-static/resources/icons/giwifi.svg
@@ -148,10 +156,14 @@ do_install() {
     is_openwrt || die "这看起来不是 OpenWrt 系统（缺 uci 或 /etc/openwrt_release）。"
     [ -f "$PKG_DIR/usr/bin/giwifi-auth" ] \
         || die "找不到 $PKG_DIR/usr/bin/giwifi-auth。请把 install.sh 与 giwifi-auth/ 目录放在一起后重试。"
+    [ -f "$PKG_DIR/usr/sbin/giwifi-policy" ] \
+        || die "找不到 $PKG_DIR/usr/sbin/giwifi-policy。请把 install.sh 与 giwifi-auth/ 目录放在一起后重试。"
+    [ -f "$PKG_DIR/etc/hotplug.d/iface/90-giwifi-policy" ] \
+        || die "找不到 $PKG_DIR/etc/hotplug.d/iface/90-giwifi-policy。请把 install.sh 与 giwifi-auth/ 目录放在一起后重试。"
     [ -f "$UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js" ] \
         || die "找不到 $UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js。请把 install.sh 与 luci-app-giwifi/ 目录放在一起后重试。"
 
-    say "[1/6] 安装依赖 python3-light python3-urllib python3-openssl ..."
+    say "[1/7] 安装依赖 python3-light python3-urllib python3-openssl ..."
     # 25.12/snapshot 已切换到 apk；老版本仍用 opkg。
     if check_python; then
         say "       python3 及所需模块已存在，跳过"
@@ -169,20 +181,27 @@ do_install() {
         warn "  [WARN] 未检测到 luci-base/luci-mod-network，LuCI 页面可能无法加载，请先安装这两个包"
     fi
 
-    say "[2/6] 写入认证脚本 /usr/bin/giwifi-auth ..."
+    say "[2/7] 写入认证脚本 /usr/bin/giwifi-auth ..."
     install_file "$PKG_DIR/usr/bin/giwifi-auth" /usr/bin/giwifi-auth 755
 
-    say "[3/6] 写入守护脚本 /etc/init.d/giwifi-auth ..."
+    say "[3/7] 写入路由策略脚本 /usr/sbin/giwifi-policy ..."
+    install_file "$PKG_DIR/usr/sbin/giwifi-policy" /usr/sbin/giwifi-policy 755
+
+    say "[4/7] 写入守护脚本 /etc/init.d/giwifi-auth ..."
     install_file "$PKG_DIR/etc/init.d/giwifi-auth" /etc/init.d/giwifi-auth 755
 
-    say "[4/6] 写入 UCI 配置 /etc/config/giwifi-auth ..."
+    say "[5/7] 写入接口热插拔脚本 /etc/hotplug.d/iface/90-giwifi-policy ..."
+    install_file "$PKG_DIR/etc/hotplug.d/iface/90-giwifi-policy" \
+        /etc/hotplug.d/iface/90-giwifi-policy 755
+
+    say "[6/7] 写入 UCI 配置 /etc/config/giwifi-auth ..."
     if [ -f "$CONFIG" ]; then
         say "       已存在，保留原配置"
     else
         install_file "$PKG_DIR/etc/config/giwifi-auth" "$CONFIG" 644
     fi
 
-    say "[5/6] 写入 LuCI 界面 ..."
+    say "[7/7] 写入 LuCI 界面 ..."
     install_file "$UI_DIR/htdocs/luci-static/resources/view/network/giwifi.js" \
         /www/luci-static/resources/view/network/giwifi.js 644
     install_file "$UI_DIR/htdocs/luci-static/resources/icons/giwifi.svg" \
@@ -192,7 +211,7 @@ do_install() {
     install_file "$UI_DIR/root/usr/share/rpcd/acl.d/luci-app-giwifi.json" \
         /usr/share/rpcd/acl.d/luci-app-giwifi.json 644
 
-    say "[6/6] 配置账号并启动 ..."
+    say "配置账号并启动 ..."
     # 账号密码是运行配置，不由安装步骤收集：
     #   有 GIWIFI_USERNAME/PASSWORD -> 写入（或更新）第一个 account 段并启动；
     #   否则只应用可选参数，保留已有配置；账号为空则不启动，给出配置指引。

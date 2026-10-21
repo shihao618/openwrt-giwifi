@@ -8,6 +8,11 @@ STOP=10
 
 start_service() {
     local enabled
+
+    # Rebuild per-account policy tables and the LAN ECMP route from UCI.
+    # This is idempotent and also removes stale routes when disabled.
+    [ -x /usr/sbin/giwifi-policy ] && /usr/sbin/giwifi-policy apply 2>/dev/null || true
+
     config_load 'giwifi-auth'
     config_get_bool enabled 'main' enabled '0'
     [ "$enabled" = "1" ] || return 0
@@ -52,4 +57,8 @@ reload_service() {
     /usr/bin/giwifi-auth sync-ua3f 2>/dev/null || true
     stop
     start
+}
+
+stop_service() {
+    [ -x /usr/sbin/giwifi-policy ] && /usr/sbin/giwifi-policy cleanup 2>/dev/null || true
 }

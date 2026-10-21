@@ -90,6 +90,12 @@ msgstr ""
 msgid "Poll interval (seconds)"
 msgstr ""
 
+msgid "Automatic ECMP load balancing"
+msgstr ""
+
+msgid "Build a native ECMP default route from the interfaces bound by enabled accounts. Stop mwan3 before using this mode."
+msgstr ""
+
 msgid "Restart interface on schedule"
 msgstr ""
 

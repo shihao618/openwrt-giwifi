@@ -346,6 +346,10 @@ return view.extend({
 		o.datatype = 'range(10,3600)';
 		o.rmempty = false;
 
+		o = s2.option(form.Flag, 'ecmp_enabled', _('Automatic ECMP load balancing'));
+		o.default = '1';
+		o.description = _('Build a native ECMP default route from the interfaces bound by enabled accounts. Stop mwan3 before using this mode.');
+
 		o = s2.option(form.Flag, 'iface_restart_enabled', _('Restart interface on schedule'));
 		o.default = '0';
 

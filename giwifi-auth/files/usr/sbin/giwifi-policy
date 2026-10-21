@@ -1,0 +1,213 @@
+#!/bin/sh
+# GiWiFi per-account policy routing + native ECMP load balancing.
+#
+# The daemon binds each account socket to its configured interface.  This
+# helper makes the corresponding router-originated traffic use that same
+# interface by creating a route table and a source-address rule per account.
+# It also builds a native ECMP default route for LAN traffic from the
+# interfaces used by the enabled accounts.
+#
+# This file is intentionally independent of mwan3: mwan3 must be disabled
+# when native ECMP mode is used.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+STATE_DIR=/tmp/giwifi-policy
+STATE_FILE=$STATE_DIR/state
+DESIRED_FILE=$STATE_DIR/desired
+LOG_TAG=giwifi-policy
+
+log() {
+    logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+}
+
+cleanup_ecmp() {
+    # Only remove our multipath default; plain netifd defaults are kept.
+    if ip route show default 2>/dev/null | grep -q 'nexthop'; then
+        ip route del default 2>/dev/null || true
+    fi
+}
+
+cleanup_all() {
+    if [ -f "$STATE_FILE" ]; then
+        while IFS='|' read -r dev table src gw weight; do
+            [ -n "$dev" ] || continue
+            if [ -n "$src" ] && [ -n "$table" ]; then
+                ip rule del from "$src" lookup "$table" priority 1000 2>/dev/null || true
+            fi
+            if [ -n "$table" ]; then
+                ip route flush table "$table" 2>/dev/null || true
+            fi
+        done < "$STATE_FILE"
+    fi
+    cleanup_ecmp
+    rm -rf "$STATE_DIR"
+}
+
+# Resolve the IPv4 gateway currently used by a device.
+iface_gateway() {
+    local dev="$1"
+    ip -4 route show default 2>/dev/null \
+        | grep -E " dev $dev( |$)" \
+        | awk '{ for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit } }' \
+        | head -n 1
+}
+
+# Resolve the first global IPv4 prefix of a device.
+iface_cidr() {
+    local dev="$1"
+    ip -4 -o addr show dev "$dev" scope global 2>/dev/null \
+        | awk '{ print $4; exit }'
+}
+
+# Derive a stable, private policy table from the device ifindex.
+iface_table() {
+    local dev="$1" ifindex table
+    ifindex=$(cat "/sys/class/net/$dev/ifindex" 2>/dev/null)
+    case "$ifindex" in
+        ''|*[!0-9]*) ifindex=0 ;;
+    esac
+    table=$((100 + ifindex))
+    [ "$table" -gt 250 ] && table=$((100 + (ifindex % 100)))
+    echo "$table"
+}
+
+_collect_account() {
+    local cfg="$1" enabled iface username password weight cidr src gw table
+
+    config_get_bool enabled "$cfg" enabled 1
+    [ "$enabled" = "1" ] || return 0
+
+    config_get username "$cfg" username ''
+    config_get password "$cfg" password ''
+    [ -n "$username" ] && [ -n "$password" ] || return 0
+
+    config_get iface "$cfg" interface ''
+    [ -n "$iface" ] || return 0
+    case "$iface" in
+        -*|*[!A-Za-z0-9_.:-]*) return 0 ;;
+    esac
+    [ -e "/sys/class/net/$iface" ] || return 0
+
+    # Each interface has exactly one policy table/ECMP nexthop.
+    case " $desired_devs " in
+        *" $iface "*) return 0 ;;
+    esac
+
+    cidr=$(iface_cidr "$iface")
+    [ -n "$cidr" ] || return 0
+
+    gw=$(iface_gateway "$iface")
+    [ -n "$gw" ] || return 0
+
+    config_get weight "$cfg" weight 1
+    case "$weight" in
+        ''|*[!0-9]*) weight=1 ;;
+    esac
+    [ "$weight" -gt 0 ] 2>/dev/null || weight=1
+    [ "$weight" -gt 100 ] 2>/dev/null && weight=100
+
+    src=${cidr%/*}
+    table=$(iface_table "$iface")
+
+    desired_devs="$desired_devs $iface"
+    desired_count=$((desired_count + 1))
+    printf '%s|%s|%s|%s|%s\n' "$iface" "$table" "$src" "$gw" "$weight" >> "$DESIRED_FILE"
+}
+
+apply_all() {
+    local main_enabled ecmp_enabled lan_cidr count dev table src gw weight
+
+    mkdir -p "$STATE_DIR" || exit 1
+
+    # Native ECMP and mwan3 policy routing cannot safely coexist.
+    if pgrep -f '[m]wan3' >/dev/null 2>&1; then
+        log 'mwan3 is running; native ECMP is disabled until mwan3 is stopped'
+        cleanup_all
+        return 0
+    fi
+
+    . /lib/functions.sh 2>/dev/null || true
+    config_load 'giwifi-auth' 2>/dev/null || {
+        cleanup_all
+        return 0
+    }
+
+    config_get_bool main_enabled 'main' enabled 0
+    config_get_bool ecmp_enabled 'main' ecmp_enabled 1
+
+    if [ "$main_enabled" != "1" ]; then
+        cleanup_all
+        return 0
+    fi
+
+    : > "$DESIRED_FILE"
+    desired_devs=''
+    desired_count=0
+
+    lan_cidr=$(iface_cidr br-lan)
+
+    config_foreach _collect_account account
+
+    # Remove the previous generation exactly.  Routes for the new generation
+    # are re-created below; this also drops a stale source IP after DHCP renew.
+    if [ -f "$STATE_FILE" ]; then
+        while IFS='|' read -r dev table src gw weight; do
+            [ -n "$dev" ] || continue
+            if [ -n "$src" ] && [ -n "$table" ]; then
+                ip rule del from "$src" lookup "$table" priority 1000 2>/dev/null || true
+            fi
+            if [ -n "$table" ]; then
+                ip route flush table "$table" 2>/dev/null || true
+            fi
+        done < "$STATE_FILE"
+    fi
+
+    while IFS='|' read -r dev table src gw weight; do
+        [ -n "$dev" ] || continue
+
+        cidr=$(iface_cidr "$dev")
+        [ -n "$cidr" ] || continue
+
+        ip route replace "$cidr" dev "$dev" table "$table" 2>/dev/null || true
+        if [ -n "$lan_cidr" ]; then
+            ip route replace "$lan_cidr" dev br-lan table "$table" 2>/dev/null || true
+        fi
+        ip route replace default via "$gw" dev "$dev" table "$table" 2>/dev/null || true
+        ip rule add from "$src" lookup "$table" priority 1000 2>/dev/null || true
+    done < "$DESIRED_FILE"
+
+    cp "$DESIRED_FILE" "$STATE_FILE"
+
+    count=$(grep -c '|' "$STATE_FILE" 2>/dev/null)
+    [ -n "$count" ] || count=0
+    if [ "$ecmp_enabled" = "1" ] && [ "$count" -ge 2 ]; then
+        set --
+        while IFS='|' read -r dev table src gw weight; do
+            [ -n "$dev" ] || continue
+            set -- "$@" nexthop via "$gw" dev "$dev" weight "$weight"
+        done < "$STATE_FILE"
+        ip route replace default "$@" 2>/dev/null || {
+            log 'failed to install ECMP default route'
+            cleanup_ecmp
+        }
+    else
+        cleanup_ecmp
+    fi
+
+    rm -f "$DESIRED_FILE"
+}
+
+case "$1" in
+    apply|sync)
+        apply_all
+        ;;
+    cleanup)
+        cleanup_all
+        ;;
+    *)
+        echo "usage: $0 apply|cleanup" >&2
+        exit 1
+        ;;
+esac

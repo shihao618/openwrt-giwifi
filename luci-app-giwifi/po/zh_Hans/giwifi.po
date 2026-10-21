@@ -90,6 +90,12 @@ msgstr "无效的 URL"
 msgid "Poll interval (seconds)"
 msgstr "轮询间隔（秒）"
 
+msgid "Automatic ECMP load balancing"
+msgstr "自动 ECMP 负载均衡"
+
+msgid "Build a native ECMP default route from the interfaces bound by enabled accounts. Stop mwan3 before using this mode."
+msgstr "根据已启用账号绑定的接口自动构建原生 ECMP 默认路由。使用前请先停用 mwan3。"
+
 msgid "Restart interface on schedule"
 msgstr "定时重启接口"
 

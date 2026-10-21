@@ -1,0 +1,12 @@
+#!/bin/sh
+# Rebuild GiWiFi policy routing/ECMP after WAN interface state changes.
+
+[ -x /usr/sbin/giwifi-policy ] || exit 0
+
+case "$ACTION" in
+    ifup|ifdown|ifupdate|connected)
+        /usr/sbin/giwifi-policy apply >/dev/null 2>&1 &
+        ;;
+esac
+
+exit 0
