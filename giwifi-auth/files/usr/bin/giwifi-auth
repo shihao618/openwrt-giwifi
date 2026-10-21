@@ -46,6 +46,7 @@ import base64
 import random
 import socket
 import struct
+import errno
 import html.parser
 import urllib.parse
 import http.client
@@ -246,13 +247,32 @@ def _iface_ipv4(iface):
             sock.close()
 
 
+def _route_dev(host, iface=None):
+    """Return the output device for host (optionally constrained to iface).
+
+    None means the ip command is unavailable, "" means no route.
+    """
+    if not host:
+        return None
+    cmd = ["ip", "-4", "route", "get", host]
+    if iface:
+        cmd += ["oif", iface]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return ""
+    m = re.search(r"\bdev\s+(\S+)", p.stdout or "")
+    return m.group(1) if m else ""
+
+
 def _iface_ready(iface):
-    """检查绑定接口是否可用于认证：存在且有 IPv4 地址。
+    """检查绑定接口是否可用于认证：存在、有 IPv4 地址且有到 Portal 的路由。
 
     返回 (ready, reason)：ready=True 时 reason 为空串；否则给出简短原因。
-    iface 为空（未绑定接口）时视为就绪——沿用「由系统默认出口发包」的旧行为。
-    多网口/单网口、有无 mwan3 都适用：mwan3 成员未 DHCP 到地址、或接口未 up
-    时提前拦截，避免发无谓的认证请求并让日志可解释。"""
+    iface 为空（未绑定接口）时视为就绪——沿用「由系统默认出口发包」的行为。
+    """
     if not iface:
         return True, ""
     if not _valid_iface_name(iface):
@@ -261,6 +281,15 @@ def _iface_ready(iface):
         return False, "接口 %s 不存在" % iface
     if not _iface_ipv4(iface):
         return False, "接口 %s 尚无 IPv4 地址（未 DHCP 或未 up）" % iface
+
+    host = urllib.parse.urlsplit(BASE_URL).hostname
+    if host:
+        dev = _route_dev(host, iface)
+        if dev == "":
+            return False, "接口 %s 暂无到 Portal %s 的路由（检查 WAN 默认网关）" % (iface, host)
+        if dev and dev != iface:
+            return False, "到 Portal %s 的路由出口是 %s，不是绑定接口 %s" % (host, dev, iface)
+
     return True, ""
 
 
@@ -638,7 +667,8 @@ def _parse_login_form(page_html):
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
-def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=None):
+def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=None,
+                 _fallback=False):
     """HTTP 请求；iface 非空时绑定指定网络接口发包（SO_BINDTODEVICE），
     并同时绑定该接口的源 IPv4 地址，确保 mwan3 多 WAN 下走对出口、选对源地址。"""
     u = urllib.parse.urlsplit(url)
@@ -694,6 +724,17 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=N
         data = resp.read()
         rh = {k.lower(): v for k, v in resp.getheaders()}
         return resp.status, rh, data
+    except OSError as e:
+        # A bound macvlan/WAN can transiently fail while the default route is
+        # already usable. Retry once through the normal routing table, but only
+        # when the kernel says the default route uses this same interface.
+        if (iface and not _fallback and
+                getattr(e, "errno", None) == errno.EHOSTUNREACH and
+                _route_dev(u.hostname) == iface):
+            print("[giwifi-auth] 接口 %s 绑定连接不可达，回退默认路由重试"
+                  % iface, flush=True)
+            return http_request(url, method, headers, body, timeout, None, True)
+        raise
     finally:
         conn.close()
 
@@ -1035,6 +1076,16 @@ def cmd_log():
 _NET_ERRORS = (OSError, http.client.HTTPException, RuntimeError)
 
 
+def _net_error_text(account, exc):
+    """把常见网络错误转成可操作的日志文本。"""
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EHOSTUNREACH:
+        host = urllib.parse.urlsplit(BASE_URL).hostname or BASE_URL
+        iface = account.interface or "默认路由"
+        return ("无法到达 Portal %s（接口=%s；检查 WAN 是否拿到默认网关/路由）"
+                % (host, iface))
+    return str(exc)
+
+
 def _next_backoff(cur):
     """指数退避：30 → 60 → 120 → 240 → 300（封顶），避免触发 Portal 风控。"""
     return min(300, cur * 2 if cur else 30)
@@ -1095,7 +1146,8 @@ def _try_login(account):
     try:
         return do_login(account)
     except _NET_ERRORS as e:
-        print("[%s] 登录异常: %s" % (account.name, e), flush=True)
+        print("[%s] 登录异常: %s" % (account.name, _net_error_text(account, e)),
+              flush=True)
         return False, "异常"
 
 
@@ -1175,7 +1227,8 @@ def cmd_login(name=None):
             online = check_online(acc)
         except _NET_ERRORS as e:
             online = None
-            print("[%s] 在线状态检查异常: %s（继续尝试登录）" % (acc.name, e), flush=True)
+            print("[%s] 在线状态检查异常: %s（继续尝试登录）"
+                  % (acc.name, _net_error_text(acc, e)), flush=True)
         if online:
             print("[%s] 当前已在线，先注销下线..." % acc.name, flush=True)
             rc = cmd_logout(acc)
@@ -1339,7 +1392,8 @@ def _run_account(account):
         try:
             online = check_online(account, sess)
         except _NET_ERRORS as e:
-            print("[%s] 检查异常: %s" % (account.name, e), flush=True)
+            print("[%s] 检查异常: %s" % (account.name, _net_error_text(account, e)),
+                  flush=True)
             online = None
         delay = INTERVAL + _jitter_interval()
         if online is False:
@@ -1362,7 +1416,8 @@ def _run_account(account):
                         backoff = _next_backoff(backoff)
                         delay = backoff
             except _NET_ERRORS as e:
-                print("[%s] 登录异常: %s" % (account.name, e), flush=True)
+                print("[%s] 登录异常: %s" % (account.name, _net_error_text(account, e)),
+                      flush=True)
                 backoff = _next_backoff(backoff)
                 delay = backoff
         elif online is True:

@@ -255,7 +255,7 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.0.0-r1.apk`
+- `artifacts/giwifi-auth-2.0.0-r2.apk`
 - `artifacts/luci-app-giwifi-2.0.0-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
 - `artifacts/openwrt-giwifi-2.0.0.zip`
