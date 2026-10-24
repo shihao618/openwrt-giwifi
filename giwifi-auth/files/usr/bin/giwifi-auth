@@ -267,9 +267,54 @@ def _route_dev(host, iface=None):
     return m.group(1) if m else ""
 
 
-def _iface_ready(iface):
-    """检查绑定接口是否可用于认证：存在、有 IPv4 地址且有到 Portal 的路由。
+def _iface_gateway(iface):
+    """返回接口当前默认网关；读不到时返回空串。"""
+    if not _valid_iface_name(iface):
+        return ""
+    try:
+        p = subprocess.run(
+            ["ip", "-4", "route", "show", "default", "dev", iface],
+            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if p.returncode != 0:
+        return ""
+    m = re.search(r"\bvia\s+(\S+)", p.stdout or "")
+    return m.group(1) if m else ""
 
+
+def _neighbor_state(iface, gateway):
+    """返回指定接口上网关邻居项的状态；没有邻居项时返回空串。
+
+    mwan2 这类 macvlan 如果上游端口只允许一个 MAC，网关 ARP 会长期停在
+    INCOMPLETE/FAILED。此时即使路由表里有一条默认路由，绑定该接口的 TCP
+    connect 也会 EHOSTUNREACH；提前发现并跳过本轮认证，可避免改走默认路由
+    把请求从别的 WAN 发出去（Portal 会把它当成同账号异常来源并限流）。
+    """
+    if not _valid_iface_name(iface) or not gateway:
+        return ""
+    try:
+        p = subprocess.run(
+            ["ip", "-4", "neigh", "show", "dev", iface],
+            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if p.returncode != 0:
+        return ""
+    for line in (p.stdout or "").splitlines():
+        fields = line.split()
+        if not fields or fields[0] != gateway:
+            continue
+        for state in ("INCOMPLETE", "FAILED", "PERMANENT", "REACHABLE",
+                      "STALE", "DELAY", "PROBE"):
+            if state in fields:
+                return state
+        return ""
+    return ""
+
+
+def _iface_ready(iface):
+    """检查绑定接口是否可用于认证：存在、有 IPv4 地址、有路由、网关 ARP 正常。
     返回 (ready, reason)：ready=True 时 reason 为空串；否则给出简短原因。
     iface 为空（未绑定接口）时视为就绪——沿用「由系统默认出口发包」的行为。
     """
@@ -289,6 +334,13 @@ def _iface_ready(iface):
             return False, "接口 %s 暂无到 Portal %s 的路由（检查 WAN 默认网关）" % (iface, host)
         if dev and dev != iface:
             return False, "到 Portal %s 的路由出口是 %s，不是绑定接口 %s" % (host, dev, iface)
+
+    gateway = _iface_gateway(iface)
+    state = _neighbor_state(iface, gateway) if gateway else ""
+    if state in ("INCOMPLETE", "FAILED"):
+        return (False,
+                "接口 %s 的网关 %s ARP %s（检查 macvlan/VLAN/上游端口是否允许该 MAC）"
+                % (iface, gateway, state))
 
     return True, ""
 
@@ -667,10 +719,13 @@ def _parse_login_form(page_html):
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
-def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=None,
-                 _fallback=False):
+def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=None):
     """HTTP 请求；iface 非空时绑定指定网络接口发包（SO_BINDTODEVICE），
-    并同时绑定该接口的源 IPv4 地址，确保 mwan3 多 WAN 下走对出口、选对源地址。"""
+    并同时绑定该接口的源 IPv4 地址，确保多 WAN 下走对出口、选对源地址。
+
+    绑定连接失败时不再回退到系统默认路由：多 WAN 下默认路由可能属于另一条
+    WAN，认证请求会从错误出口发出，Portal 会把它当成同账号异常来源并限流。
+    接口暂不可用时交由上层退避重试。"""
     u = urllib.parse.urlsplit(url)
     if u.scheme == "https":
         conn = http.client.HTTPSConnection(u.hostname, u.port or 443,
@@ -724,17 +779,6 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10, iface=N
         data = resp.read()
         rh = {k.lower(): v for k, v in resp.getheaders()}
         return resp.status, rh, data
-    except OSError as e:
-        # A bound macvlan/WAN can transiently fail while the default route is
-        # already usable. Retry once through the normal routing table, but only
-        # when the kernel says the default route uses this same interface.
-        if (iface and not _fallback and
-                getattr(e, "errno", None) == errno.EHOSTUNREACH and
-                _route_dev(u.hostname) == iface):
-            print("[giwifi-auth] 接口 %s 绑定连接不可达，回退默认路由重试"
-                  % iface, flush=True)
-            return http_request(url, method, headers, body, timeout, None, True)
-        raise
     finally:
         conn.close()
 

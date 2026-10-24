@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=giwifi-auth
-PKG_VERSION:=2.1.2
+PKG_VERSION:=2.1.3
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=yangxingyu <1767274678@qq.com>
