@@ -1076,18 +1076,19 @@ def _beijing_now():
                          time.gmtime(time.time() + _BEIJING_OFFSET_SECONDS))
 
 
-def _log(ok, info, action=""):
+def _log(ok, info, action="", account=None):
     """追加一条认证日志（滚动保留最近 LOG_KEEP 条）。
 
-    行格式: [时间] 成功/失败 [动作] 详情
+    行格式: [时间] [用户名 (接口)] 成功/失败 [动作] 详情
     追加用 O_APPEND 单行原子写；超过 LOG_TRIM 条时先写临时文件再
     os.replace 原子替换，避免并发读写（守护 + 手动命令）损坏日志。
     """
     try:
         tag = "成功" if ok else "失败"
+        who = "[%s] " % _account_label(account) if account is not None else ""
         act = "[%s] " % action if action else ""
-        line = "[%s] %s %s%s" % (_beijing_now(), tag,
-                                 act, (info or "").strip())
+        line = "[%s] %s%s %s%s" % (_beijing_now(), who, tag,
+                                   act, (info or "").strip())
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         tmp = None
@@ -1182,16 +1183,16 @@ def cmd_logout(account):
         except (ValueError, TypeError):
             raise RuntimeError("注销返回非 JSON: %s" % raw[:200])
         if dec.get("status") == 1:
-            print("[%s] 已下线" % account.name, flush=True)
-            _log(True, "已下线", "logout")
+            print("[%s] 已下线" % _account_label(account), flush=True)
+            _log(True, "已下线", "logout", account)
             return 0
         msg = dec.get("info") or ("status=%s" % dec.get("status"))
-        print("[%s] 注销失败: %s" % (account.name, msg), flush=True)
-        _log(False, "注销失败: %s" % msg, "logout")
+        print("[%s] 注销失败: %s" % (_account_label(account), msg), flush=True)
+        _log(False, "注销失败: %s" % msg, "logout", account)
         return 1
     except _NET_ERRORS as e:
-        print("[%s] 注销异常: %s" % (account.name, e), flush=True)
-        _log(False, "注销异常: %s" % e, "logout")
+        print("[%s] 注销异常: %s" % (_account_label(account), e), flush=True)
+        _log(False, "注销异常: %s" % e, "logout", account)
         return 2
 
 
@@ -1200,8 +1201,8 @@ def _try_login(account):
     try:
         return do_login(account)
     except _NET_ERRORS as e:
-        print("[%s] 登录异常: %s" % (account.name, _net_error_text(account, e)),
-              flush=True)
+        print("[%s] 登录异常: %s" % (_account_label(account),
+                                  _net_error_text(account, e)), flush=True)
         return False, "异常"
 
 
@@ -1211,7 +1212,8 @@ def _login_with_retry(account):
     if ok:
         return True, info
     if "频繁" in info or "5秒后再试" in info:
-        print("[%s] 操作过于频繁，等待 6 秒后重试认证" % account.name, flush=True)
+        print("[%s] 操作过于频繁，等待 6 秒后重试认证"
+              % _account_label(account), flush=True)
         time.sleep(6)
         ok, info = _try_login(account)
     return ok, info
@@ -1274,29 +1276,30 @@ def cmd_login(name=None):
         accounts = all_accounts
     overall_ok = True
     for acc in accounts:
+        label = _account_label(acc)
         ready, why = _iface_ready(acc.interface)
         if not ready:
-            print("[%s] 警告: %s" % (acc.name, why), flush=True)
+            print("[%s] 警告: %s" % (label, why), flush=True)
         try:
             online = check_online(acc)
         except _NET_ERRORS as e:
             online = None
             print("[%s] 在线状态检查异常: %s（继续尝试登录）"
-                  % (acc.name, _net_error_text(acc, e)), flush=True)
+                  % (label, _net_error_text(acc, e)), flush=True)
         if online:
-            print("[%s] 当前已在线，先注销下线..." % acc.name, flush=True)
+            print("[%s] 当前已在线，先注销下线..." % label, flush=True)
             rc = cmd_logout(acc)
-            print("[%s] 冷却 6 秒后重新认证" % acc.name, flush=True)
+            print("[%s] 冷却 6 秒后重新认证" % label, flush=True)
             time.sleep(6)
         ok, info = _login_with_retry(acc)
-        _log(ok, info, "login")
+        _log(ok, info, "login", acc)
         if ok:
-            print("[%s] 登录成功: %s" % (acc.name, info), flush=True)
+            print("[%s] 登录成功: %s" % (label, info), flush=True)
         else:
-            print("[%s] 登录失败: %s" % (acc.name, info), flush=True)
+            print("[%s] 登录失败: %s" % (label, info), flush=True)
             overall_ok = False
             if "403" in info or "Forbidden" in info:
-                print("[%s] 提示: Portal 拒绝了当前 User-Agent。" % acc.name, flush=True)
+                print("[%s] 提示: Portal 拒绝了当前 User-Agent。" % label, flush=True)
     return 0 if overall_ok else 1
 
 
@@ -1430,8 +1433,8 @@ def _iface_restart_loop():
 
 def _run_account(account):
     """单账号守护循环：在独立线程中运行，轮询该账号接口的在线状态并认证。"""
-    print("[giwifi-auth] 启动账号监控: %s 接口=%s 间隔=%ds 账号=%s"
-          % (account.name, account.interface, INTERVAL,
+    print("[giwifi-auth] 启动账号监控: %s 间隔=%ds 账号=%s"
+          % (_account_label(account), INTERVAL,
              _mask_account(account.username)), flush=True)
     sess = _Session(account.ua, account.interface)
     backoff = 0
@@ -1449,23 +1452,26 @@ def _run_account(account):
                 pass
         last_ready = ready
         if not ready:
-            print("[%s] %s，%d 秒后重试" % (account.name, why, INTERVAL), flush=True)
+            print("[%s] %s，%d 秒后重试"
+                  % (_account_label(account), why, INTERVAL), flush=True)
             time.sleep(INTERVAL)
             continue
         try:
             online = check_online(account, sess)
         except _NET_ERRORS as e:
-            print("[%s] 检查异常: %s" % (account.name, _net_error_text(account, e)),
+            print("[%s] 检查异常: %s"
+                  % (_account_label(account), _net_error_text(account, e)),
                   flush=True)
             online = None
         delay = INTERVAL + _jitter_interval()
         if online is False:
-            print("[%s] 掉线，尝试登录" % account.name, flush=True)
+            print("[%s] 掉线，尝试登录" % _account_label(account), flush=True)
             try:
                 ok, info = do_login(account, sess)
                 print("[%s] %s: %s"
-                      % (account.name, "登录成功" if ok else "登录失败", info), flush=True)
-                _log(ok, info, "auto")
+                      % (_account_label(account),
+                         "登录成功" if ok else "登录失败", info), flush=True)
+                _log(ok, info, "auto", account)
                 if ok:
                     backoff = 0
                 else:
@@ -1474,12 +1480,13 @@ def _run_account(account):
                         backoff = lb
                         delay = lb
                         print("[%s] Portal 限制，等待 %d 分钟后重试"
-                              % (account.name, lb // 60), flush=True)
+                              % (_account_label(account), lb // 60), flush=True)
                     else:
                         backoff = _next_backoff(backoff)
                         delay = backoff
             except _NET_ERRORS as e:
-                print("[%s] 登录异常: %s" % (account.name, _net_error_text(account, e)),
+                print("[%s] 登录异常: %s"
+                      % (_account_label(account), _net_error_text(account, e)),
                       flush=True)
                 backoff = _next_backoff(backoff)
                 delay = backoff
@@ -1488,7 +1495,8 @@ def _run_account(account):
         else:
             backoff = _next_backoff(backoff)
             delay = backoff
-            print("[%s] 检查失败（网络异常），稍后重试" % account.name, flush=True)
+            print("[%s] 检查失败（网络异常），稍后重试"
+                  % _account_label(account), flush=True)
         elapsed = time.monotonic() - start
         time.sleep(max(1, delay - elapsed))
 
