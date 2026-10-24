@@ -338,6 +338,16 @@ def _iface_ready(iface):
     gateway = _iface_gateway(iface)
     state = _neighbor_state(iface, gateway) if gateway else ""
     if state in ("INCOMPLETE", "FAILED"):
+        # The neighbor entry may be stale after an interface flap.  Send one
+        # short probe to refresh it before declaring the interface unusable.
+        try:
+            subprocess.run(
+                ["ping", "-c", "1", "-W", "1", "-I", iface, gateway],
+                capture_output=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        state = _neighbor_state(iface, gateway)
+    if state in ("INCOMPLETE", "FAILED"):
         return (False,
                 "接口 %s 的网关 %s ARP %s（检查 macvlan/VLAN/上游端口是否允许该 MAC）"
                 % (iface, gateway, state))
@@ -1425,10 +1435,19 @@ def _run_account(account):
              _mask_account(account.username)), flush=True)
     sess = _Session(account.ua, account.interface)
     backoff = 0
+    last_ready = None
     while True:
         _refresh_cfg(stop_if_disabled=True)
         start = time.monotonic()
         ready, why = _iface_ready(account.interface)
+        if last_ready is not None and ready != last_ready:
+            # Keep LAN/UA3F ECMP in sync with the auth interface health.
+            try:
+                subprocess.run(["/usr/sbin/giwifi-policy", "apply"],
+                               capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        last_ready = ready
         if not ready:
             print("[%s] %s，%d 秒后重试" % (account.name, why, INTERVAL), flush=True)
             time.sleep(INTERVAL)

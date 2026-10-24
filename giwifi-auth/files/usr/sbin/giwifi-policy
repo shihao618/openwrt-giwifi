@@ -56,6 +56,15 @@ iface_gateway() {
         | head -n 1
 }
 
+# Return 0 when the interface's gateway neighbor is unusable.
+gateway_neighbor_bad() {
+    local dev="$1" gw="$2" state
+    [ -n "$gw" ] || return 0
+    state=$(ip -4 neigh show dev "$dev" 2>/dev/null \
+        | awk -v gw="$gw" '$1 == gw { for (i = 1; i <= NF; i++) if ($i == "INCOMPLETE" || $i == "FAILED") { print $i; exit } }')
+    [ -n "$state" ]
+}
+
 # Resolve the first global IPv4 prefix of a device.
 iface_cidr() {
     local dev="$1"
@@ -102,6 +111,17 @@ _collect_account() {
 
     gw=$(iface_gateway "$iface")
     [ -n "$gw" ] || return 0
+
+    # Do not put a WAN into ECMP when its gateway ARP is already known bad:
+    # LAN/UA3F traffic would be hashed onto a dead nexthop and fail with
+    # EHOSTUNREACH.  A short ping refreshes a stale/INCOMPLETE entry first.
+    if gateway_neighbor_bad "$iface" "$gw"; then
+        ping -c 1 -W 1 -I "$iface" "$gw" >/dev/null 2>&1 || true
+    fi
+    if gateway_neighbor_bad "$iface" "$gw"; then
+        log "skip $iface: gateway $gw ARP is unusable"
+        return 0
+    fi
 
     config_get weight "$cfg" weight 1
     case "$weight" in
