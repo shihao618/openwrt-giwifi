@@ -1260,6 +1260,34 @@ def _resolve_accounts(accounts, target):
     return []
 
 
+def _recover_interface(iface):
+    """Reset a WAN device after repeated gateway ARP failures.
+
+    macvlan/VLAN gateways sometimes keep a FAILED neighbour entry after an
+    upstream flap; a carrier down/up lets netifd and the DHCP client rebuild
+    the interface state.  Neighbour cache is flushed first so the next probe
+    performs a fresh ARP exchange.
+    """
+    if not _valid_iface_name(iface):
+        return
+    try:
+        gateway = _iface_gateway(iface)
+        subprocess.run(["ip", "-4", "neigh", "flush", "dev", iface],
+                       capture_output=True, timeout=5)
+        subprocess.run(["ip", "link", "set", iface, "down"],
+                       capture_output=True, timeout=5)
+        time.sleep(2)
+        subprocess.run(["ip", "link", "set", iface, "up"],
+                       capture_output=True, timeout=5)
+        time.sleep(2)
+        if gateway:
+            subprocess.run(
+                ["ping", "-c", "1", "-W", "1", "-I", iface, gateway],
+                capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def cmd_login(name=None):
     """立即登录。name 为空时登录所有启用的账号，否则只登录该账号。"""
     _refresh_cfg()
@@ -1280,6 +1308,9 @@ def cmd_login(name=None):
         ready, why = _iface_ready(acc.interface)
         if not ready:
             print("[%s] 警告: %s" % (label, why), flush=True)
+            if "ARP" in why:
+                overall_ok = False
+                continue
         try:
             online = check_online(acc)
         except _NET_ERRORS as e:
@@ -1439,6 +1470,8 @@ def _run_account(account):
     sess = _Session(account.ua, account.interface)
     backoff = 0
     last_ready = None
+    arp_failures = 0
+    last_recovery = 0.0
     while True:
         _refresh_cfg(stop_if_disabled=True)
         start = time.monotonic()
@@ -1452,10 +1485,23 @@ def _run_account(account):
                 pass
         last_ready = ready
         if not ready:
+            if "ARP" in why:
+                arp_failures += 1
+            else:
+                arp_failures = 0
+            now = time.monotonic()
+            if (arp_failures >= 3 and now - last_recovery >= 300):
+                print("[%s] 网关 ARP 连续 %d 次失败，尝试重启接口 %s"
+                      % (_account_label(account), arp_failures,
+                         account.interface), flush=True)
+                _recover_interface(account.interface)
+                arp_failures = 0
+                last_recovery = now
             print("[%s] %s，%d 秒后重试"
                   % (_account_label(account), why, INTERVAL), flush=True)
             time.sleep(INTERVAL)
             continue
+        arp_failures = 0
         try:
             online = check_online(account, sess)
         except _NET_ERRORS as e:
