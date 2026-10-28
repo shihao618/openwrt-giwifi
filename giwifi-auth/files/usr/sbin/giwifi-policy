@@ -17,6 +17,17 @@ STATE_DIR=/tmp/giwifi-policy
 STATE_FILE=$STATE_DIR/state
 DESIRED_FILE=$STATE_DIR/desired
 LOG_TAG=giwifi-policy
+POLICY_LOCK=/var/run/giwifi-policy.lock
+
+# Serialize apply/cleanup: two account threads can change readiness at the
+# same time (e.g. after ARP recovery), and concurrent generation rewrites can
+# otherwise leave the ECMP default with only one nexthop (100M instead of
+# aggregated bandwidth).
+exec 9>"$POLICY_LOCK"
+if ! flock -n 9; then
+    logger -t "$LOG_TAG" "another policy generation is running; skip" 2>/dev/null || true
+    exit 0
+fi
 
 log() {
     logger -t "$LOG_TAG" "$*" 2>/dev/null || true
