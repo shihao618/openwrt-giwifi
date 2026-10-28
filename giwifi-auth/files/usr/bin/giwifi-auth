@@ -1318,10 +1318,12 @@ def cmd_login(name=None):
             print("[%s] 在线状态检查异常: %s（继续尝试登录）"
                   % (label, _net_error_text(acc, e)), flush=True)
         if online:
-            print("[%s] 当前已在线，先注销下线..." % label, flush=True)
-            rc = cmd_logout(acc)
-            print("[%s] 冷却 6 秒后重新认证" % label, flush=True)
-            time.sleep(6)
+            # Manual "login" means "ensure this account is online", not
+            # "force a logout/relogin".  Forcing logout costs a 10s logout
+            # timeout + 6s cooldown + login, which can exceed rpcd's 30s
+            # execution timeout and make LuCI show "(no output)".
+            print("[%s] 当前已在线，无需重新登录" % label, flush=True)
+            continue
         ok, info = _login_with_retry(acc)
         _log(ok, info, "login", acc)
         if ok:

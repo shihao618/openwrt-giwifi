@@ -31,7 +31,7 @@ const DEVICE_TYPES = [
 	[ 'android', 'Android' ]
 ];
 
-const VERSION = '2.1.6';
+const VERSION = '2.1.7';
 
 /* Query procd service state through ubus, the authoritative source. */
 const callServiceList = rpc.declare({
