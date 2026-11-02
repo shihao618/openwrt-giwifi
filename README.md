@@ -3,6 +3,9 @@
 在 OpenWrt 路由器上自动登录校园网（GiWiFi Web Portal，`authLogin` 流），掉线自动重登。
 路由器登录后，其 WAN 侧会话即被校园网认证，**整个内网（电脑/手机）都能上网**。
 
+- 账号行的“登录”按钮：账号离线时正常登录，已在线时强制注销并重新登录。
+- 设置页支持每日定时重登，账号之间带随机间隔，降低 Portal 风控概率。
+
 > 2.0.0 起仅面向全新安装（OpenWrt 25.12 / apk），不提供 1.x 旧配置和旧界面的迁移逻辑。
 
 ## 目录结构
@@ -108,8 +111,8 @@ wget -qO- 'https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openw
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
-# 固定使用 v2.1.8 的 artifacts
-wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.8 sh
+# 固定使用 v2.1.10 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.10 sh
 
 # 自定义 artifact 镜像前缀
 wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
@@ -305,10 +308,10 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.1.8-r1.apk`
-- `artifacts/luci-app-giwifi-2.1.8-r1.apk`
+- `artifacts/giwifi-auth-2.1.10-r1.apk`
+- `artifacts/luci-app-giwifi-2.1.10-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
-- `artifacts/openwrt-giwifi-2.1.8.zip`
+- `artifacts/openwrt-giwifi-2.1.10.zip`
 
 ## 测试
 

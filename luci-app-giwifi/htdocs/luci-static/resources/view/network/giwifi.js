@@ -31,7 +31,7 @@ const DEVICE_TYPES = [
 	[ 'android', 'Android' ]
 ];
 
-const VERSION = '2.1.8';
+const VERSION = '2.1.10';
 
 /* Query procd service state through ubus, the authoritative source. */
 const callServiceList = rpc.declare({
@@ -364,6 +364,27 @@ return view.extend({
 			}
 		}
 
+		o = s2.option(form.Flag, 'relogin_enabled', _('Scheduled re-login'));
+		o.default = '0';
+		o.description = _('Force every enabled account to log out and authenticate again at the configured time each day.');
+
+		o = s2.option(form.ListValue, 'relogin_time', _('Re-login time'));
+		o.default = '04:30';
+		o.rmempty = false;
+		o.description = _('Local time on the router');
+		for (let hour = 0; hour < 24; hour++) {
+			for (let minute = 0; minute < 60; minute += 15) {
+				const value = ('0' + hour).slice(-2) + ':' + ('0' + minute).slice(-2);
+				o.value(value, value);
+			}
+		}
+
+		o = s2.option(form.Value, 'relogin_jitter', _('Re-login account interval (seconds)'));
+		o.default = '8';
+		o.datatype = 'range(0,300)';
+		o.rmempty = false;
+		o.description = _('Random delay between accounts during scheduled re-login to reduce Portal rate limiting.');
+
 		o = s2.option(form.ListValue, 'ua3f_sync_ua', _('UA3F terminal type synchronization'));
 		o.value('', _('Do not synchronize (leave UA3F unchanged)'));
 		DEVICE_TYPES.forEach(function(t) {
@@ -489,6 +510,7 @@ return view.extend({
 			const loginBtn = E('button', {
 				'class': 'btn cbi-button cbi-button-apply',
 				'click': ui.createHandlerFn(this, 'handleAccountLogin', section_id),
+				'title': _('Log in; if already online, force a re-login'),
 				'disabled': this.map.readonly || null
 			}, [ _('Log in') ]);
 

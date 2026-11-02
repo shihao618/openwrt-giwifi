@@ -4,6 +4,9 @@ config giwifi 'main'
 	option interval '30'
 	option iface_restart_enabled '0'
 	option iface_restart_time '04:00'
+	option relogin_enabled '0'
+	option relogin_time '04:30'
+	option relogin_jitter '8'
 	option ua3f_sync_ua ''
 	# 自动用启用账号绑定的接口构建原生 ECMP 默认路由。
 	# 使用前必须停用 mwan3。

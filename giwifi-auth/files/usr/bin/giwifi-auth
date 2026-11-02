@@ -361,6 +361,10 @@ BASE_URL = "http://10.189.1.3"
 INTERVAL = 30
 IFACE_RESTART_ENABLED = False
 IFACE_RESTART_TIME = ""
+RELOGIN_ENABLED = False
+RELOGIN_TIME = "04:30"
+RELOGIN_JITTER = 8
+RELOGIN_TRIGGER_DIR = "/tmp/giwifi-auth/relogin"
 ENABLED = True
 UA3F_SYNC_UA = ""  # 全局配置：同步给 UA3F 的 UA（空则不动 UA3F）
 
@@ -379,7 +383,7 @@ def _pick_opt(section, key, default):
 def _load_global_cfg():
     """加载 main section 全局配置。"""
     global BASE_URL, INTERVAL, IFACE_RESTART_ENABLED, IFACE_RESTART_TIME, \
-        ENABLED, UA3F_SYNC_UA
+        RELOGIN_ENABLED, RELOGIN_TIME, RELOGIN_JITTER, ENABLED, UA3F_SYNC_UA
     sections = _load_uci_config()
     main = sections.get("main", {})
     BASE_URL = _pick_opt(main, "base_url", "http://10.189.1.3").rstrip("/")
@@ -391,6 +395,16 @@ def _load_global_cfg():
         INTERVAL = 10
     IFACE_RESTART_ENABLED = _pick_opt(main, "iface_restart_enabled", "0").lower() in ("1", "true", "yes", "on")
     IFACE_RESTART_TIME = _pick_opt(main, "iface_restart_time", "04:00")
+    RELOGIN_ENABLED = _pick_opt(main, "relogin_enabled", "0").lower() in ("1", "true", "yes", "on")
+    RELOGIN_TIME = _pick_opt(main, "relogin_time", "04:30")
+    try:
+        RELOGIN_JITTER = int(_pick_opt(main, "relogin_jitter", "8"))
+    except ValueError:
+        RELOGIN_JITTER = 8
+    if RELOGIN_JITTER < 0:
+        RELOGIN_JITTER = 0
+    if RELOGIN_JITTER > 300:
+        RELOGIN_JITTER = 300
     ENABLED = _pick_opt(main, "enabled", "0").lower() in ("1", "true", "yes", "on")
     UA3F_SYNC_UA = _pick_opt(main, "ua3f_sync_ua", "")
 
@@ -1296,6 +1310,77 @@ def _recover_interface(iface):
         _RECOVERY_LOCK.release()
 
 
+def _daemon_running():
+    """Return True when the procd-managed daemon is already running."""
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmdline = f.read().replace(b"\0", b" ").decode(
+                    "utf-8", "replace")
+        except OSError:
+            continue
+        if "giwifi-auth" in cmdline and re.search(r"\brun\b", cmdline):
+            return True
+    return False
+
+
+def _enqueue_relogin(account):
+    """Ask the running daemon to force a logout+login for one account.
+
+    LuCI's rpcd exec has a 30s timeout.  A forced logout adds a 10s HTTP
+    timeout plus cooldown, so the UI must not wait for the whole operation.
+    The daemon watches this directory and performs the re-login inside the
+    account's own monitor thread (no concurrent session use).
+    """
+    if not _valid_iface_name(account.interface):
+        return False
+    try:
+        os.makedirs(RELOGIN_TRIGGER_DIR, exist_ok=True)
+        target = os.path.join(RELOGIN_TRIGGER_DIR, account.interface)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(account.interface)
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        return False
+
+
+def _force_relogin(account, sess=None):
+    """Force logout then login; used by manual button and scheduler.
+
+    Returns (ok, info).  An account that is already offline skips logout and
+    goes straight to login.  A failed logout must not block the new login.
+    """
+    label = _account_label(account)
+    ready, why = _iface_ready(account.interface)
+    if not ready:
+        print("[%s] 重登跳过: %s" % (label, why), flush=True)
+        return False, "接口不可用"
+    try:
+        online = check_online(account, sess)
+    except _NET_ERRORS as e:
+        print("[%s] 重登前检查异常: %s" % (label, e), flush=True)
+        online = None
+    if online:
+        print("[%s] 当前在线，开始重登" % label, flush=True)
+        cmd_logout(account)
+        time.sleep(3)
+    else:
+        print("[%s] 当前离线，直接登录" % label, flush=True)
+    ok, info = _login_with_retry(account)
+    _log(ok, info, "relogin", account)
+    print("[%s] %s: %s"
+          % (label, "重登成功" if ok else "重登失败", info), flush=True)
+    return ok, info
+
+
 def cmd_login(name=None):
     """立即登录。name 为空时登录所有启用的账号，否则只登录该账号。"""
     _refresh_cfg()
@@ -1326,11 +1411,13 @@ def cmd_login(name=None):
             print("[%s] 在线状态检查异常: %s（继续尝试登录）"
                   % (label, _net_error_text(acc, e)), flush=True)
         if online:
-            # Manual "login" means "ensure this account is online", not
-            # "force a logout/relogin".  Forcing logout costs a 10s logout
-            # timeout + 6s cooldown + login, which can exceed rpcd's 30s
-            # execution timeout and make LuCI show "(no output)".
-            print("[%s] 当前已在线，无需重新登录" % label, flush=True)
+            if _daemon_running() and _enqueue_relogin(acc):
+                print("[%s] 当前已在线，已提交重登任务" % label,
+                      flush=True)
+            else:
+                ok, info = _force_relogin(acc)
+                if not ok:
+                    overall_ok = False
             continue
         ok, info = _login_with_retry(acc)
         _log(ok, info, "login", acc)
@@ -1472,7 +1559,76 @@ def _iface_restart_loop():
         time.sleep(30)
 
 
-def _run_account(account):
+def _relogin_wait(trigger, timeout):
+    """Sleep up to timeout seconds; return True when a relogin was requested.
+
+    The event is intentionally not cleared here: the loop top owns clearing
+    it, otherwise a request arriving during sleep would be silently lost.
+    """
+    if trigger is None:
+        time.sleep(timeout)
+        return False
+    return trigger.wait(timeout=max(1, timeout))
+
+
+def _relogin_loop(events):
+    """Daily scheduled forced re-login for every enabled account."""
+    last_trigger = None
+    while True:
+        _load_global_cfg()
+        if RELOGIN_ENABLED:
+            now = time.localtime()
+            trigger_key = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min)
+            relogin_at = _parse_hhmm(RELOGIN_TIME)
+            due = relogin_at is not None and \
+                (now.tm_hour, now.tm_min) == relogin_at
+            if trigger_key != last_trigger and due:
+                last_trigger = trigger_key
+                accounts = _load_accounts()
+                for index, acc in enumerate(accounts):
+                    event = events.get(acc.interface) or events.get(acc.name)
+                    if event is None:
+                        continue
+                    print("[giwifi-auth] 定时重登: %s"
+                          % _account_label(acc), flush=True)
+                    event.set()
+                    if index + 1 < len(accounts) and RELOGIN_JITTER > 0:
+                        time.sleep(random.randint(0, RELOGIN_JITTER))
+        time.sleep(20)
+
+
+def _relogin_watchdog(events):
+    """Watch the trigger directory populated by `giwifi-auth login`."""
+    try:
+        os.makedirs(RELOGIN_TRIGGER_DIR, exist_ok=True)
+        for name in os.listdir(RELOGIN_TRIGGER_DIR):
+            try:
+                os.unlink(os.path.join(RELOGIN_TRIGGER_DIR, name))
+            except OSError:
+                pass
+    except OSError:
+        return
+    while True:
+        try:
+            names = os.listdir(RELOGIN_TRIGGER_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            if name.endswith(".tmp"):
+                continue
+            path = os.path.join(RELOGIN_TRIGGER_DIR, name)
+            event = events.get(name)
+            if event is not None:
+                print("[giwifi-auth] 收到重登请求: %s" % name, flush=True)
+                event.set()
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        time.sleep(1)
+
+
+def _run_account(account, trigger=None):
     """单账号守护循环：在独立线程中运行，轮询该账号接口的在线状态并认证。"""
     print("[giwifi-auth] 启动账号监控: %s 间隔=%ds 账号=%s"
           % (_account_label(account), INTERVAL,
@@ -1484,6 +1640,16 @@ def _run_account(account):
     last_recovery = 0.0
     while True:
         _refresh_cfg(stop_if_disabled=True)
+        if trigger is not None and trigger.is_set():
+            trigger.clear()
+            try:
+                _force_relogin(account, sess)
+            except _NET_ERRORS as e:
+                print("[%s] 重登异常: %s"
+                      % (_account_label(account), _net_error_text(account, e)),
+                      flush=True)
+            _relogin_wait(trigger, INTERVAL)
+            continue
         start = time.monotonic()
         ready, why = _iface_ready(account.interface)
         if last_ready is not None and ready != last_ready:
@@ -1509,7 +1675,7 @@ def _run_account(account):
                 last_recovery = now
             print("[%s] %s，%d 秒后重试"
                   % (_account_label(account), why, INTERVAL), flush=True)
-            time.sleep(INTERVAL)
+            _relogin_wait(trigger, INTERVAL)
             continue
         arp_failures = 0
         try:
@@ -1554,21 +1720,26 @@ def _run_account(account):
             print("[%s] 检查失败（网络异常），稍后重试"
                   % _account_label(account), flush=True)
         elapsed = time.monotonic() - start
-        time.sleep(max(1, delay - elapsed))
+        _relogin_wait(trigger, max(1, delay - elapsed))
 
 
 def cmd_run():
-    """多账号守护：为每个启用账号启动独立线程，另起定时重启接口线程。"""
+    """多账号守护：为每个启用账号启动独立线程，另起定时/手动重登线程。"""
     _refresh_cfg(stop_if_disabled=True)
     accounts = _load_accounts()
     if not accounts:
         print("[giwifi-auth] 无已启用账号，退出", flush=True)
         return
-    print("[giwifi-auth] 启动 %d 个账号监控线程 + 定时接口重启线程"
+    print("[giwifi-auth] 启动 %d 个账号监控线程 + 定时接口重启/重登线程"
           % len(accounts), flush=True)
+    events = {}
     threads = []
     for acc in accounts:
-        t = threading.Thread(target=_run_account, args=(acc,),
+        event = threading.Event()
+        if acc.interface:
+            events[acc.interface] = event
+        events[acc.name] = event
+        t = threading.Thread(target=_run_account, args=(acc, event),
                              name="giwifi-%s" % acc.name, daemon=True)
         t.start()
         threads.append(t)
@@ -1576,6 +1747,14 @@ def cmd_run():
                           daemon=True)
     rt.start()
     threads.append(rt)
+    rl = threading.Thread(target=_relogin_loop, args=(events,),
+                          name="giwifi-relogin-schedule", daemon=True)
+    rl.start()
+    threads.append(rl)
+    wd = threading.Thread(target=_relogin_watchdog, args=(events,),
+                          name="giwifi-relogin-watchdog", daemon=True)
+    wd.start()
+    threads.append(wd)
     # 主线程等待所有子线程（守护线程随主线程退出）
     try:
         while True:

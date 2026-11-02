@@ -456,6 +456,15 @@ def test_rebind_flow():
                 pass
 
 
+def test_relogin_wait_preserves_event():
+    """重登事件不能在等待函数里被清掉，否则请求会丢失。"""
+    mod = _load_module()
+    event = threading.Event()
+    event.set()
+    assert mod._relogin_wait(event, 1) is True
+    assert event.is_set()
+
+
 TEST_FUNCS = [
     ("uci-parse", test_uci_parse),
     ("account-targeting", test_account_targeting),
@@ -465,6 +474,7 @@ TEST_FUNCS = [
     ("check-online", test_check_online),
     ("device-type-ua", test_device_type_ua),
     ("rebind-flow", test_rebind_flow),
+    ("relogin-event", test_relogin_wait_preserves_event),
 ]
 
 

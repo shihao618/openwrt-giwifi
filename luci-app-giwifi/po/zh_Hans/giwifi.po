@@ -105,6 +105,24 @@ msgstr "重启时间"
 msgid "Local time on the router"
 msgstr "使用路由器本地时间"
 
+msgid "Scheduled re-login"
+msgstr "定时重登"
+
+msgid "Force every enabled account to log out and authenticate again at the configured time each day."
+msgstr "每天在指定时间强制所有已启用账号注销并重新认证。"
+
+msgid "Re-login time"
+msgstr "重登时间"
+
+msgid "Re-login account interval (seconds)"
+msgstr "重登账号间隔（秒）"
+
+msgid "Random delay between accounts during scheduled re-login to reduce Portal rate limiting."
+msgstr "定时重登时账号之间的随机间隔，降低 Portal 风控概率。"
+
+msgid "Log in; if already online, force a re-login"
+msgstr "登录；若已在线则强制重登"
+
 msgid "UA3F terminal type synchronization"
 msgstr "同步给 UA3F 的终端类型"
 
