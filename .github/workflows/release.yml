@@ -25,17 +25,17 @@ jobs:
           OpenWrt 25.12 / apk fresh-install release.
 
           Packages:
-          - giwifi-auth-2.1.10-r1.apk
-          - luci-app-giwifi-2.1.10-r1.apk
+          - giwifi-auth-2.1.11-r1.apk
+          - luci-app-giwifi-2.1.11-r1.apk
           - luci-i18n-giwifi-zh-cn-0.261102.19468.apk
-          - openwrt-giwifi-2.1.10.zip
+          - openwrt-giwifi-2.1.11.zip
 
           Install:
           ```
-          apk add --allow-untrusted giwifi-auth-2.1.10-r1.apk luci-app-giwifi-2.1.10-r1.apk luci-i18n-giwifi-zh-cn-0.261102.19468.apk
+          apk add --allow-untrusted giwifi-auth-2.1.11-r1.apk luci-app-giwifi-2.1.11-r1.apk luci-i18n-giwifi-zh-cn-0.261102.19468.apk
           ```
 
-          2.1.10 is fresh-install only; no 1.x configuration migration.
+          2.1.11 is fresh-install only; no 1.x configuration migration.
           EOF
 
           gh release create "${GITHUB_REF_NAME}" \

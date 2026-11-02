@@ -23,7 +23,7 @@ openwrt-giwifi/
 │       │   ├── config/giwifi-auth          # UCI 配置模板
 │       │   └── hotplug.d/iface/90-giwifi-policy  # 接口变化时重建策略路由
 │       ├── usr/bin/giwifi-auth             # 认证脚本（纯标准库 Python3）
-│       └── usr/sbin/giwifi-policy          # 每账号路由表 + 原生 ECMP 管理器
+│       └── usr/sbin/giwifi-policy          # 原生 ECMP 管理器
 ├── luci-app-giwifi/              # LuCI 界面包（官方 luci.mk / htdocs / root / po 结构）
 │   ├── Makefile                  # LUCI_TITLE / LUCI_DEPENDS + luci.mk
 │   ├── htdocs/luci-static/resources/view/network/giwifi.js
@@ -50,13 +50,15 @@ openwrt-giwifi/
 - 自动换绑：`auto_rebind=1` 时遇绑定冲突（reasoncode=43 / 设备数超限提示）自动 `reBindMac`；
   密码错误(27)、热点风控(55)、封禁类提示**不会**触发换绑；
 - 可选用 iPad / iPhone / Windows / Android UA，或自定义 UA；
-- 可选每天定时重启接口（界面直接选择时间）；
-- 可选把全局 UA 同步给 UA3F（`ua3f_sync_ua`）；
-- 多网口自动负载均衡：启用多个账号并绑定不同 WAN 接口后，插件自动为每个账号建立
-  独立路由表 + 源地址规则，并用这些接口生成原生 ECMP 默认路由；无需手工写
-  `ip rule`/`ip route`，也不依赖 mwan3（ECMP 模式要求停用 mwan3）；
-  认证请求仍同时绑定出接口与源 IP，多 WAN 下不会走错出口；绑定接口无地址时提前提示并退避；
-- LuCI 页面：运行状态、账号在线状态、最近认证日志、账号增删改、手动登录。
+- 可选项每天定时重启接口（界面直接选择时间）；
+- 可选项每天定时强制重登（界面选择时间，账号间带随机间隔）；
+- 可选项把全局 UA 同步给 UA3F（`ua3f_sync_ua`）；
+- 多网口自动负载均衡：启用多个账号并绑定不同 WAN 接口后，插件只用这些接口
+  生成原生 ECMP 默认路由，不再创建每账号路由表或源地址规则；认证请求通过
+  `SO_BINDTODEVICE` + 绑定源 IP 正确出接口。无需手工写 `ip rule`/`ip route`，
+  也不依赖 mwan3（ECMP 模式要求停用 mwan3）；
+- 账号行的登录按钮：离线时登录，已在线时强制注销并重新登录；
+- LuCI 页面：运行状态、账号在线状态、最近认证日志、账号增删改、手动登录、定时重登。
 
 ## 依赖
 
@@ -111,8 +113,8 @@ wget -qO- 'https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openw
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
-# 固定使用 v2.1.10 的 artifacts
-wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.10 sh
+# 固定使用 v2.1.11 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.11 sh
 
 # 自定义 artifact 镜像前缀
 wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
@@ -179,6 +181,9 @@ config giwifi 'main'
 	option interval '30'                # 轮询间隔秒（下限 10）
 	option iface_restart_enabled '0'    # 定时重启接口
 	option iface_restart_time '04:00'   # 每天重启时间 HH:MM
+	option relogin_enabled '0'          # 定时强制重登
+	option relogin_time '04:30'         # 每天重登时间 HH:MM
+	option relogin_jitter '8'           # 账号之间的随机间隔秒数
 	option ua3f_sync_ua ''              # 同步给 UA3F 的终端类型，空=不改
 	option ecmp_enabled '1'             # 根据账号绑定接口自动做 ECMP 负载均衡
 
@@ -201,6 +206,9 @@ config account 'name'                   # 可多个（LuCI 添加的为匿名段
 | `enabled` | 是否启用守护 | `0` |
 | `base_url` | Portal 基地址 | `http://10.189.1.3` |
 | `interval` | 轮询间隔秒（加 0~20% 随机抖动） | `30` |
+| `relogin_enabled` | 每天定时强制重登所有启用账号 | `0` |
+| `relogin_time` | 定时重登时间 `HH:MM` | `04:30` |
+| `relogin_jitter` | 定时重登时账号之间的随机间隔秒数 | `8` |
 | `ecmp_enabled` | 根据账号绑定接口自动构建原生 ECMP 默认路由 | `1` |
 | `device_type` | `ipad`/`iphone`/`windows`/`android` | `windows` |
 | `device_ua` | 自定义 UA（非空时优先） | 空 |
@@ -210,11 +218,16 @@ config account 'name'                   # 可多个（LuCI 添加的为匿名段
 
 ## 自动 ECMP 负载均衡
 
-插件会自动读取所有已启用账号的 `interface`，为每个接口生成：
+插件会自动读取所有已启用账号的 `interface`，只生成一条原生 ECMP 默认路由：
 
-- 独立路由表：`table 100 + ifindex`；
-- 源地址规则：`from <接口 IPv4> lookup <table> priority 1000`；
-- 所有接口的 ECMP 默认路由：`nexthop via <网关> dev <接口> weight 1`。
+```text
+default
+    nexthop via <网关> dev <接口> weight 1
+    ...
+```
+
+账号认证请求仍通过 `SO_BINDTODEVICE` + 绑定该接口源 IPv4 发出，因此不再需要
+每账号的路由表和 `from <源IP>` 规则。
 
 LAN 侧的新连接会按 Linux ECMP 哈希分摊到各 WAN；单个 TCP 连接仍然只走一条
 WAN，因此这是**多连接/多线程总带宽叠加**，不是单连接带宽叠加。
@@ -229,9 +242,8 @@ L4（`net.ipv4.fib_multipath_hash_policy=1`）。否则同一客户端到同一�
   `giwifi-policy` 检测到 mwan3 进程时会清理本插件生成的路由并跳过 ECMP 配置；
 - **必须安装 `ip-full`**：本包已声明依赖；若卸载了 mwan3，注意不要连带移除 `ip-full`，
   否则 ECMP 路由无法创建，只能走 metric 最小的 wan1；
-- **UA3F/TPROXY 兼容**：UA3F 会接管 LAN 的 TCP，其出站 socket 带 fwmark `0xc9`；
-  插件会加一条优先级 500 的 `fwmark 0xc9 lookup main` 规则，让 UA3F 出站也走 ECMP。
-  没有这条规则时，UA3F 从同一个 WAN 源地址发出所有代理连接，看起来就是“多线程始终用 wan1”；
+- **UA3F/TPROXY**：UA3F 的 TPROXY 出站 socket 会自动使用 main 表的 ECMP，
+  插件不再添加 `fwmark 0xc9` 规则，也不再创建每账号源地址规则；
 - 接口 up/down、DHCP 续租、账号增删改、插件保存并应用时都会自动重建；
 - 账号接口必须已经取得 IPv4 地址和默认网关，否则该接口暂不参与 ECMP；
 - 权重默认均为 1；如需调整，可在账号 section 中加 `option weight '2'`（1~100）。
@@ -241,8 +253,8 @@ L4（`net.ipv4.fib_multipath_hash_policy=1`）。否则同一客户端到同一�
 安装后进入 **网络 → GiWiFi 认证**（`luci-app-giwifi` 包）：
 
 - **运行状态**：插件版本、守护状态、账号在线状态（显示用户名+接口）；
-- **设置**：启用、Portal 地址、轮询间隔、自动 ECMP 负载均衡、定时重启时间、UA3F 同步终端类型；
-- **账号列表**：左侧接口图标+用户名，中间显示终端类型、账号状态、自动换绑状态，右侧操作按钮；操作列提供 **登录 / 停止或启用 / 编辑 / 删除**；
+- **设置**：启用、Portal 地址、轮询间隔、自动 ECMP 负载均衡、定时重启接口、定时重登、UA3F 同步终端类型；
+- **账号列表**：左侧接口图标+用户名，中间显示终端类型、账号状态、自动换绑状态，右侧操作按钮；操作列提供 **登录 / 停止或启用 / 编辑 / 删除**；登录按钮在账号已在线时执行强制重登；
 - **日志**：最近认证日志；
 - 「添加账号」弹窗内填写绑定接口、账号、密码、终端类型、自定义 UA、自动换绑；
 - 绑定接口下拉框只列出 **WAN 防火墙区域** 内的接口（区域名不要求是 `wan`，按 masq / wan 类名称 / wan 网络识别）；
@@ -308,10 +320,10 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.1.10-r1.apk`
-- `artifacts/luci-app-giwifi-2.1.10-r1.apk`
+- `artifacts/giwifi-auth-2.1.11-r1.apk`
+- `artifacts/luci-app-giwifi-2.1.11-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
-- `artifacts/openwrt-giwifi-2.1.10.zip`
+- `artifacts/openwrt-giwifi-2.1.11.zip`
 
 ## 测试
 

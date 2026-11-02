@@ -1,11 +1,10 @@
 #!/bin/sh
-# GiWiFi per-account policy routing + native ECMP load balancing.
+# GiWiFi native ECMP load balancing.
 #
-# The daemon binds each account socket to its configured interface.  This
-# helper makes the corresponding router-originated traffic use that same
-# interface by creating a route table and a source-address rule per account.
-# It also builds a native ECMP default route for LAN traffic from the
-# interfaces used by the enabled accounts.
+# Account authentication sockets bind SO_BINDTODEVICE and their WAN source
+# address directly, so no per-account route table or source-address ip rule
+# is needed.  LAN traffic (including UA3F's proxied sockets) simply uses the
+# native ECMP default route built from the healthy account interfaces.
 #
 # This file is intentionally independent of mwan3: mwan3 must be disabled
 # when native ECMP mode is used.
@@ -41,6 +40,8 @@ cleanup_ecmp() {
 }
 
 cleanup_all() {
+    # Remove old source rules/tables from pre-2.1.11 generations.  New
+    # generations do not create them.
     if [ -f "$STATE_FILE" ]; then
         while IFS='|' read -r dev table src gw weight; do
             [ -n "$dev" ] || continue
@@ -52,7 +53,7 @@ cleanup_all() {
             fi
         done < "$STATE_FILE"
     fi
-    # UA3F's transparent-proxy output mark bypasses the per-WAN source rules.
+    # Old UA3F mark bypass from pre-2.1.11 generations.
     ip rule del fwmark 0xc9 lookup main priority 500 2>/dev/null || true
     cleanup_ecmp
     rm -rf "$STATE_DIR"
@@ -83,20 +84,8 @@ iface_cidr() {
         | awk '{ print $4; exit }'
 }
 
-# Derive a stable, private policy table from the device ifindex.
-iface_table() {
-    local dev="$1" ifindex table
-    ifindex=$(cat "/sys/class/net/$dev/ifindex" 2>/dev/null)
-    case "$ifindex" in
-        ''|*[!0-9]*) ifindex=0 ;;
-    esac
-    table=$((100 + ifindex))
-    [ "$table" -gt 250 ] && table=$((100 + (ifindex % 100)))
-    echo "$table"
-}
-
 _collect_account() {
-    local cfg="$1" enabled iface username password weight cidr src gw table
+    local cfg="$1" enabled iface username password weight cidr gw
 
     config_get_bool enabled "$cfg" enabled 1
     [ "$enabled" = "1" ] || return 0
@@ -112,7 +101,7 @@ _collect_account() {
     esac
     [ -e "/sys/class/net/$iface" ] || return 0
 
-    # Each interface has exactly one policy table/ECMP nexthop.
+    # Each interface has exactly one ECMP nexthop.
     case " $desired_devs " in
         *" $iface "*) return 0 ;;
     esac
@@ -141,16 +130,15 @@ _collect_account() {
     [ "$weight" -gt 0 ] 2>/dev/null || weight=1
     [ "$weight" -gt 100 ] 2>/dev/null && weight=100
 
-    src=${cidr%/*}
-    table=$(iface_table "$iface")
-
     desired_devs="$desired_devs $iface"
     desired_count=$((desired_count + 1))
-    printf '%s|%s|%s|%s|%s\n' "$iface" "$table" "$src" "$gw" "$weight" >> "$DESIRED_FILE"
+    # Keep the historical five-field state format; table/src are empty in
+    # the current generation and only used by cleanup of old generations.
+    printf '%s|||%s|%s\n' "$iface" "$gw" "$weight" >> "$DESIRED_FILE"
 }
 
 apply_all() {
-    local main_enabled ecmp_enabled lan_cidr count dev table src gw weight
+    local main_enabled ecmp_enabled count dev table src gw weight
 
     mkdir -p "$STATE_DIR" || exit 1
 
@@ -160,11 +148,10 @@ apply_all() {
         echo 1 > /proc/sys/net/ipv4/fib_multipath_hash_policy 2>/dev/null || true
     fi
 
-    # UA3F is a transparent TPROXY helper.  Its outbound sockets carry
-    # fwmark 0xc9; without this higher-priority rule they match the
-    # per-WAN "from <WAN IP>" rules below and every proxied LAN connection
-    # exits a single WAN, regardless of the ECMP route.
-    ip rule add fwmark 0xc9 lookup main priority 500 2>/dev/null || true
+    # Remove the old UA3F mark bypass from pre-2.1.11 generations.  Auth
+    # sockets use SO_BINDTODEVICE + source binding; LAN/UA3F traffic uses
+    # the plain ECMP default, so no fwmark rule is needed anymore.
+    ip rule del fwmark 0xc9 lookup main priority 500 2>/dev/null || true
 
     # Native ECMP and mwan3 policy routing cannot safely coexist.
     if pgrep -f '[m]wan3' >/dev/null 2>&1; then
@@ -191,12 +178,10 @@ apply_all() {
     desired_devs=''
     desired_count=0
 
-    lan_cidr=$(iface_cidr br-lan)
-
     config_foreach _collect_account account
 
-    # Remove the previous generation exactly.  Routes for the new generation
-    # are re-created below; this also drops a stale source IP after DHCP renew.
+    # Remove the previous generation's source rules/tables.  New generations
+    # only install the ECMP default and no per-account policy rules.
     if [ -f "$STATE_FILE" ]; then
         while IFS='|' read -r dev table src gw weight; do
             [ -n "$dev" ] || continue
@@ -208,20 +193,6 @@ apply_all() {
             fi
         done < "$STATE_FILE"
     fi
-
-    while IFS='|' read -r dev table src gw weight; do
-        [ -n "$dev" ] || continue
-
-        cidr=$(iface_cidr "$dev")
-        [ -n "$cidr" ] || continue
-
-        ip route replace "$cidr" dev "$dev" table "$table" 2>/dev/null || true
-        if [ -n "$lan_cidr" ]; then
-            ip route replace "$lan_cidr" dev br-lan table "$table" 2>/dev/null || true
-        fi
-        ip route replace default via "$gw" dev "$dev" table "$table" 2>/dev/null || true
-        ip rule add from "$src" lookup "$table" priority 1000 2>/dev/null || true
-    done < "$DESIRED_FILE"
 
     cp "$DESIRED_FILE" "$STATE_FILE"
 
