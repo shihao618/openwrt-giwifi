@@ -465,6 +465,38 @@ def test_relogin_wait_preserves_event():
     assert event.is_set()
 
 
+def test_force_relogin_recovery_retry():
+    """重登遇到网络异常时应重启接口并重试一次。"""
+    mod = _load_module()
+
+    class Account:
+        interface = "mwan-test"
+        username = "155"
+        password = "x"
+
+    calls = {"attempt": 0, "recover": 0}
+
+    def fake_once(account, sess=None):
+        calls["attempt"] += 1
+        if calls["attempt"] == 1:
+            return False, "异常"
+        return True, "认证成功"
+
+    def fake_recover(iface):
+        calls["recover"] += 1
+
+    mod._relogin_once = fake_once
+    mod._recover_interface = fake_recover
+    mod._wait_iface_ready = lambda iface, timeout=30: (True, "")
+    mod._log = lambda ok, info, tag, account: None
+
+    ok, info = mod._force_relogin(Account())
+    assert ok is True
+    assert info == "认证成功"
+    assert calls["attempt"] == 2
+    assert calls["recover"] == 1
+
+
 TEST_FUNCS = [
     ("uci-parse", test_uci_parse),
     ("account-targeting", test_account_targeting),
@@ -475,6 +507,7 @@ TEST_FUNCS = [
     ("device-type-ua", test_device_type_ua),
     ("rebind-flow", test_rebind_flow),
     ("relogin-event", test_relogin_wait_preserves_event),
+    ("relogin-recovery-retry", test_force_relogin_recovery_retry),
 ]
 
 

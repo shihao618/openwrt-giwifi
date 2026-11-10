@@ -1352,12 +1352,21 @@ def _enqueue_relogin(account):
         return False
 
 
-def _force_relogin(account, sess=None):
-    """Force logout then login; used by manual button and scheduler.
+def _wait_iface_ready(iface, timeout=30):
+    """Wait until a WAN has a usable IPv4 address and gateway neighbour."""
+    deadline = time.monotonic() + max(0, timeout)
+    why = "接口未就绪"
+    while True:
+        ready, why = _iface_ready(iface)
+        if ready:
+            return True, ""
+        if time.monotonic() >= deadline:
+            return False, why
+        time.sleep(2)
 
-    Returns (ok, info).  An account that is already offline skips logout and
-    goes straight to login.  A failed logout must not block the new login.
-    """
+
+def _relogin_once(account, sess=None):
+    """One logout+login attempt.  Returns (ok, info)."""
     label = _account_label(account)
     ready, why = _iface_ready(account.interface)
     if not ready:
@@ -1374,7 +1383,32 @@ def _force_relogin(account, sess=None):
         time.sleep(3)
     else:
         print("[%s] 当前离线，直接登录" % label, flush=True)
-    ok, info = _login_with_retry(account)
+    return _login_with_retry(account)
+
+
+def _force_relogin(account, sess=None):
+    """Force logout then login; used by manual button and scheduler.
+
+    Returns (ok, info).  An account that is already offline skips logout and
+    goes straight to login.  A failed logout must not block the new login.
+
+    A forced relogin often races a temporarily unusable WAN gateway (the
+    logout/login HTTP requests time out first, then ARP goes INCOMPLETE).
+    When the first attempt fails with a network error, reset that WAN and
+    retry once after DHCP/ARP recover instead of waiting for the monitor's
+    slower three-strikes recovery.
+    """
+    label = _account_label(account)
+    ok, info = _relogin_once(account, sess)
+    if not ok and (info == "异常" or info == "接口不可用"):
+        print("[%s] 重登失败(%s)，重启接口 %s 后重试"
+              % (label, info, account.interface), flush=True)
+        _recover_interface(account.interface)
+        ready, why = _wait_iface_ready(account.interface, 30)
+        if ready:
+            ok, info = _relogin_once(account, sess)
+        else:
+            info = "接口恢复失败: %s" % why
     _log(ok, info, "relogin", account)
     print("[%s] %s: %s"
           % (label, "重登成功" if ok else "重登失败", info), flush=True)
