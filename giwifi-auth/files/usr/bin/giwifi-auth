@@ -337,7 +337,12 @@ def _iface_ready(iface):
             return False, "到 Portal %s 的路由出口是 %s，不是绑定接口 %s" % (host, dev, iface)
 
     gateway = _iface_gateway(iface)
-    state = _neighbor_state(iface, gateway) if gateway else ""
+    if not gateway:
+        return False, "接口 %s 没有默认网关" % iface
+    # Do not probe the gateway with ICMP: campus gateways commonly block
+    # echo requests while forwarding normally, which made healthy WANs look
+    # unreachable.  A usable default route + non-FAILED neighbour is enough.
+    state = _neighbor_state(iface, gateway)
     if state in ("INCOMPLETE", "FAILED"):
         # The neighbor entry may be stale after an interface flap.  Send one
         # short probe to refresh it before declaring the interface unusable.
@@ -350,7 +355,7 @@ def _iface_ready(iface):
         state = _neighbor_state(iface, gateway)
     if state in ("INCOMPLETE", "FAILED"):
         return (False,
-                "接口 %s 的网关 %s ARP %s（检查 macvlan/VLAN/上游端口是否允许该 MAC）"
+                "接口 %s 的网关 %s ARP %s（检查 macvlan/VLAN/上游端口及默认路由）"
                 % (iface, gateway, state))
 
     return True, ""
@@ -1275,6 +1280,30 @@ def _resolve_accounts(accounts, target):
     return []
 
 
+def _netifd_interface_for_device(device):
+    """Resolve the netifd interface name that owns a Linux device.
+
+    Restarting a macvlan with ``ip link set down/up`` is not enough for a
+    stuck DHCP/gateway state; re-running netifd's ifdown/ifup renews DHCP and
+    reinstalls the default route.  Account config stores the device name
+    (e.g. mwan2), while netifd knows the logical interface (e.g. wan2).
+    """
+    try:
+        out = subprocess.run(
+            ["ubus", "call", "network.interface", "dump"],
+            capture_output=True, timeout=5).stdout
+        data = json.loads(out.decode("utf-8", "replace"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    for item in data.get("interface") or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("device") == device
+                or item.get("l3_device") == device):
+            return item.get("interface") or ""
+    return ""
+
+
 def _recover_interface(iface):
     """Reset a WAN device after repeated gateway ARP failures.
 
@@ -1282,6 +1311,11 @@ def _recover_interface(iface):
     upstream flap; a carrier down/up lets netifd and the DHCP client rebuild
     the interface state.  Neighbour cache is flushed first so the next probe
     performs a fresh ARP exchange.
+
+    A plain ``ip link down/up`` does not re-run DHCP or reinstall the default
+    route.  When netifd knows the interface (wan1/wan2), restart it through
+    ifdown/ifup instead; fall back to link down/up only when it cannot be
+    resolved.
     """
     if not _valid_iface_name(iface):
         return
@@ -1292,14 +1326,24 @@ def _recover_interface(iface):
         return
     try:
         gateway = _iface_gateway(iface)
+        netifd_iface = _netifd_interface_for_device(iface)
         subprocess.run(["ip", "-4", "neigh", "flush", "dev", iface],
                        capture_output=True, timeout=5)
-        subprocess.run(["ip", "link", "set", iface, "down"],
-                       capture_output=True, timeout=5)
-        time.sleep(2)
-        subprocess.run(["ip", "link", "set", iface, "up"],
-                       capture_output=True, timeout=5)
-        time.sleep(2)
+        if netifd_iface:
+            # Same operation as LuCI's "Restart" on the WAN interface.
+            subprocess.run(["ifdown", netifd_iface],
+                           capture_output=True, timeout=20)
+            time.sleep(1)
+            subprocess.run(["ifup", netifd_iface],
+                           capture_output=True, timeout=20)
+            time.sleep(3)
+        else:
+            subprocess.run(["ip", "link", "set", iface, "down"],
+                           capture_output=True, timeout=5)
+            time.sleep(2)
+            subprocess.run(["ip", "link", "set", iface, "up"],
+                           capture_output=True, timeout=5)
+            time.sleep(2)
         if gateway:
             subprocess.run(
                 ["ping", "-c", "1", "-W", "1", "-I", iface, gateway],
@@ -1435,7 +1479,7 @@ def cmd_login(name=None):
         ready, why = _iface_ready(acc.interface)
         if not ready:
             print("[%s] 警告: %s" % (label, why), flush=True)
-            if "ARP" in why:
+            if ("ARP" in why or "网关" in why or "路由" in why):
                 overall_ok = False
                 continue
         try:
@@ -1695,7 +1739,7 @@ def _run_account(account, trigger=None):
                 pass
         last_ready = ready
         if not ready:
-            if "ARP" in why:
+            if "ARP" in why or "网关" in why or "路由" in why:
                 arp_failures += 1
             else:
                 arp_failures = 0

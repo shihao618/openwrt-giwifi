@@ -57,7 +57,7 @@ openwrt-giwifi/
   生成原生 ECMP 默认路由，不再创建每账号路由表或源地址规则；认证请求通过
   `SO_BINDTODEVICE` + 绑定源 IP 正确出接口。无需手工写 `ip rule`/`ip route`，
   也不依赖 mwan3（ECMP 模式要求停用 mwan3）；
-- 账号行的“登录”按钮：离线时正常登录，已在线时强制注销并重新登录；强制重登遇到网络异常时会自动重启对应 WAN 后重试一次。
+- 账号行的“登录”按钮：离线时正常登录，已在线时强制注销并重新登录；强制重登遇到网络异常时会自动重启对应 WAN（ifdown/ifup，等同 LuCI 重启接口）后重试一次。
 - LuCI 页面：运行状态、账号在线状态、最近认证日志、账号增删改、手动登录、定时重登。
 
 ## 依赖
@@ -113,8 +113,8 @@ wget -qO- 'https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openw
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
-# 固定使用 v2.1.12 的 artifacts
-wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.12 sh
+# 固定使用 v2.1.15 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.15 sh
 
 # 自定义 artifact 镜像前缀
 wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
@@ -320,10 +320,10 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.1.12-r1.apk`
-- `artifacts/luci-app-giwifi-2.1.12-r1.apk`
+- `artifacts/giwifi-auth-2.1.15-r1.apk`
+- `artifacts/luci-app-giwifi-2.1.15-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
-- `artifacts/openwrt-giwifi-2.1.12.zip`
+- `artifacts/openwrt-giwifi-2.1.15.zip`
 
 ## 测试
 

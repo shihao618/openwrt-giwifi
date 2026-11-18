@@ -497,6 +497,23 @@ def test_force_relogin_recovery_retry():
     assert calls["recover"] == 1
 
 
+def test_netifd_device_mapping():
+    """账户配置的是 Linux 设备名，恢复时要能映射到 netifd 的 wanX。"""
+    mod = _load_module()
+
+    class Result:
+        stdout = (b'{"interface":[{"interface":"wan2","device":"mwan2",'
+                  b'"l3_device":"mwan2"}]}')
+
+    original = mod.subprocess.run
+    try:
+        mod.subprocess.run = lambda *args, **kwargs: Result()
+        assert mod._netifd_interface_for_device("mwan2") == "wan2"
+        assert mod._netifd_interface_for_device("missing") == ""
+    finally:
+        mod.subprocess.run = original
+
+
 TEST_FUNCS = [
     ("uci-parse", test_uci_parse),
     ("account-targeting", test_account_targeting),
@@ -508,6 +525,7 @@ TEST_FUNCS = [
     ("rebind-flow", test_rebind_flow),
     ("relogin-event", test_relogin_wait_preserves_event),
     ("relogin-recovery-retry", test_force_relogin_recovery_retry),
+    ("netifd-device-map", test_netifd_device_mapping),
 ]
 
 
