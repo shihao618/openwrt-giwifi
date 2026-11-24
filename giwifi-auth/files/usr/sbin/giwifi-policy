@@ -154,7 +154,10 @@ apply_all() {
     ip rule del fwmark 0xc9 lookup main priority 500 2>/dev/null || true
 
     # Native ECMP and mwan3 policy routing cannot safely coexist.
-    if pgrep -f '[m]wan3' >/dev/null 2>&1; then
+    # Do not use a bare "mwan3" pattern: udhcpc -i mwan3 contains the
+    # interface name and would falsely disable ECMP when an account is called
+    # mwan3.  Match the mwan3 helper path instead.
+    if pgrep -f '/usr/sbin/mwan3' >/dev/null 2>&1; then
         log 'mwan3 is running; native ECMP is disabled until mwan3 is stopped'
         cleanup_all
         return 0
