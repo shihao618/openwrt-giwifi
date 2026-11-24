@@ -113,8 +113,8 @@ wget -qO- 'https://ghproxy.net/https://raw.githubusercontent.com/shihao618/openw
 脚本会从仓库 `artifacts/` 下载三个 apk 并安装。固定版本或使用镜像：
 
 ```sh
-# 固定使用 v2.1.18 的 artifacts
-wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.18 sh
+# 固定使用 v2.1.20 的 artifacts
+wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_REF=v2.1.20 sh
 
 # 自定义 artifact 镜像前缀
 wget -q -O - https://raw.githubusercontent.com/shihao618/openwrt-giwifi/main/install-online.sh | GIWIFI_BASE=https://your-mirror/giwifi sh
@@ -320,10 +320,10 @@ OPENWRT_SDK=/path/to/openwrt-sdk python3 scripts/build_release.py [--dist dist] 
 
 `artifacts/` 存放随代码一起发布的 OpenWrt 25.12 apk 包，可直接下载安装：
 
-- `artifacts/giwifi-auth-2.1.18-r1.apk`
-- `artifacts/luci-app-giwifi-2.1.18-r1.apk`
+- `artifacts/giwifi-auth-2.1.20-r1.apk`
+- `artifacts/luci-app-giwifi-2.1.20-r1.apk`
 - `artifacts/luci-i18n-giwifi-zh-cn-*.apk`
-- `artifacts/openwrt-giwifi-2.1.18.zip`
+- `artifacts/openwrt-giwifi-2.1.20.zip`
 
 ## 测试
 

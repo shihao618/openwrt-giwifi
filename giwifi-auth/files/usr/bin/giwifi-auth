@@ -1487,6 +1487,20 @@ def _relogin_once(account, sess=None):
     return _login_with_retry(account)
 
 
+def _policy_apply():
+    """Rebuild ECMP after an account becomes online.
+
+    A WAN can recover after the last readiness transition was already
+    processed while its gateway was still bad; without this refresh it stays
+    missing from the ECMP default and 4 online accounts only use 3 WANs.
+    """
+    try:
+        subprocess.run(["/usr/sbin/giwifi-policy", "apply"],
+                       capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _force_relogin(account, sess=None):
     """Force logout then login; used by manual button and scheduler.
 
@@ -1511,6 +1525,8 @@ def _force_relogin(account, sess=None):
         else:
             info = "接口恢复失败: %s" % why
     _log(ok, info, "relogin", account)
+    if ok:
+        _policy_apply()
     print("[%s] %s: %s"
           % (label, "重登成功" if ok else "重登失败", info), flush=True)
     return ok, info
@@ -1561,6 +1577,7 @@ def cmd_login(name=None):
         _log(ok, info, "login", acc)
         if ok:
             print("[%s] 登录成功: %s" % (label, info), flush=True)
+            _policy_apply()
         else:
             print("[%s] 登录失败: %s" % (label, info), flush=True)
             overall_ok = False
@@ -1837,6 +1854,7 @@ def _run_account(account, trigger=None):
                 _log(ok, info, "auto", account)
                 if ok:
                     backoff = 0
+                    _policy_apply()
                 else:
                     lb = _long_backoff_seconds(info)
                     if lb:
@@ -1862,6 +1880,19 @@ def _run_account(account, trigger=None):
                   % _account_label(account), flush=True)
         elapsed = time.monotonic() - start
         _relogin_wait(trigger, max(1, delay - elapsed))
+
+
+def _policy_sync_loop():
+    """Keep ECMP in sync with currently usable account interfaces.
+
+    Account readiness can change from false to true after the last policy
+    apply (for example mwan3/mwan4 finishes DHCP and its gateway ARP becomes
+    valid).  Without a periodic refresh a 4-account setup can stay on only
+    3 WANs and top out around 300M.
+    """
+    while True:
+        time.sleep(30)
+        _policy_apply()
 
 
 def cmd_run():
@@ -1892,6 +1923,10 @@ def cmd_run():
                           name="giwifi-relogin-schedule", daemon=True)
     rl.start()
     threads.append(rl)
+    ps = threading.Thread(target=_policy_sync_loop, name="giwifi-policy-sync",
+                          daemon=True)
+    ps.start()
+    threads.append(ps)
     wd = threading.Thread(target=_relogin_watchdog, args=(events,),
                           name="giwifi-relogin-watchdog", daemon=True)
     wd.start()
