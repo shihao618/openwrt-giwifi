@@ -1304,6 +1304,36 @@ def _netifd_interface_for_device(device):
     return ""
 
 
+def _netifd_gateway_for_device(device):
+    """Return the default-route next hop netifd wants for a device.
+
+    On some macvlan/DHCP combinations netifd reports a default route in
+    ``ifstatus`` but fails to install it in the kernel.  The account then
+    looks like it has no gateway even though DHCP succeeded.
+    """
+    try:
+        out = subprocess.run(
+            ["ubus", "call", "network.interface", "dump"],
+            capture_output=True, timeout=5).stdout
+        data = json.loads(out.decode("utf-8", "replace"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    for item in data.get("interface") or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("device") != device
+                and item.get("l3_device") != device):
+            continue
+        for route in item.get("route") or []:
+            if not isinstance(route, dict):
+                continue
+            target = route.get("target")
+            nexthop = route.get("nexthop")
+            if target in ("0.0.0.0", "0") and nexthop:
+                return nexthop
+    return ""
+
+
 def _recover_interface(iface):
     """Reset a WAN device after repeated gateway ARP failures.
 
@@ -1344,6 +1374,16 @@ def _recover_interface(iface):
             subprocess.run(["ip", "link", "set", iface, "up"],
                            capture_output=True, timeout=5)
             time.sleep(2)
+        # netifd can report a default route in ifstatus yet fail to install it
+        # for a third macvlan.  Restore it explicitly so the account has a
+        # usable gateway until the next netifd reload.
+        if not _iface_gateway(iface):
+            fallback_gw = _netifd_gateway_for_device(iface)
+            if fallback_gw:
+                subprocess.run(
+                    ["ip", "route", "replace", "default", "via",
+                     fallback_gw, "dev", iface, "metric", "10"],
+                    capture_output=True, timeout=5)
         if gateway:
             subprocess.run(
                 ["ping", "-c", "1", "-W", "1", "-I", iface, gateway],

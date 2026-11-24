@@ -503,12 +503,14 @@ def test_netifd_device_mapping():
 
     class Result:
         stdout = (b'{"interface":[{"interface":"wan2","device":"mwan2",'
-                  b'"l3_device":"mwan2"}]}')
+                  b'"l3_device":"mwan2","route":[{"target":"0.0.0.0",'
+                  b'"nexthop":"10.50.0.1"}]}]}')
 
     original = mod.subprocess.run
     try:
         mod.subprocess.run = lambda *args, **kwargs: Result()
         assert mod._netifd_interface_for_device("mwan2") == "wan2"
+        assert mod._netifd_gateway_for_device("mwan2") == "10.50.0.1"
         assert mod._netifd_interface_for_device("missing") == ""
     finally:
         mod.subprocess.run = original
