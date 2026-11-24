@@ -1334,6 +1334,29 @@ def _netifd_gateway_for_device(device):
     return ""
 
 
+def _ensure_default_route(iface):
+    """Install an explicit default route when netifd only reports one.
+
+    Multiple macvlan DHCP interfaces sharing one parent gateway can make
+    netifd report a default route in ifstatus while the kernel has none.  A
+    newly added account therefore sees "没有默认网关" until the next recovery.
+    Restore it from netifd's own route information immediately.
+    """
+    if _iface_gateway(iface):
+        return True
+    gateway = _netifd_gateway_for_device(iface)
+    if not gateway:
+        return False
+    try:
+        subprocess.run(
+            ["ip", "route", "replace", "default", "via", gateway,
+             "dev", iface, "metric", "10"],
+            capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(_iface_gateway(iface))
+
+
 def _recover_interface(iface):
     """Reset a WAN device after repeated gateway ARP failures.
 
@@ -1377,13 +1400,7 @@ def _recover_interface(iface):
         # netifd can report a default route in ifstatus yet fail to install it
         # for a third macvlan.  Restore it explicitly so the account has a
         # usable gateway until the next netifd reload.
-        if not _iface_gateway(iface):
-            fallback_gw = _netifd_gateway_for_device(iface)
-            if fallback_gw:
-                subprocess.run(
-                    ["ip", "route", "replace", "default", "via",
-                     fallback_gw, "dev", iface, "metric", "10"],
-                    capture_output=True, timeout=5)
+        _ensure_default_route(iface)
         if gateway:
             subprocess.run(
                 ["ping", "-c", "1", "-W", "1", "-I", iface, gateway],
@@ -1517,6 +1534,9 @@ def cmd_login(name=None):
     for acc in accounts:
         label = _account_label(acc)
         ready, why = _iface_ready(acc.interface)
+        if not ready and "没有默认网关" in why:
+            _ensure_default_route(acc.interface)
+            ready, why = _iface_ready(acc.interface)
         if not ready:
             print("[%s] 警告: %s" % (label, why), flush=True)
             if ("ARP" in why or "网关" in why or "路由" in why):
@@ -1770,6 +1790,9 @@ def _run_account(account, trigger=None):
             continue
         start = time.monotonic()
         ready, why = _iface_ready(account.interface)
+        if not ready and "没有默认网关" in why:
+            _ensure_default_route(account.interface)
+            ready, why = _iface_ready(account.interface)
         if last_ready is not None and ready != last_ready:
             # Keep LAN/UA3F ECMP in sync with the auth interface health.
             try:
